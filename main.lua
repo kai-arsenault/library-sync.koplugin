@@ -3820,7 +3820,7 @@ function GrimmorySync:flushBookOrbitRegistrationQueue(manifest)
     local result = { queued = #items, linked = 0, unmatched = 0, failed = 0 }
     if #items == 0 then return true, result end
 
-    local StateManager, _, runtime_err = self:bookOrbitRuntime(false)
+    local StateManager, ignored_client, runtime_err = self:bookOrbitRuntime(false)
     if not StateManager then
         self.bookorbit_link_queue = queued
         result.failed = #items
@@ -3868,7 +3868,7 @@ function GrimmorySync:flushBookOrbitRegistrationQueue(manifest)
     end
 
     if #fallback > 0 then
-        local _, client, client_err = self:bookOrbitRuntime(true)
+        local ignored_state_manager, client, client_err = self:bookOrbitRuntime(true)
         if not client then
             for _, item in ipairs(fallback) do self.bookorbit_link_queue[item.path] = item end
             result.failed = result.failed + #fallback
@@ -5007,7 +5007,7 @@ function GrimmorySync:uploadAuthorImage(author, image, token)
     local headers = self:apiAuthHeaders(token)
     headers["accept"] = "application/json"
     headers["content-type"] = "multipart/form-data; boundary=" .. boundary
-    local _, err = self:httpRequest(self:buildServerUrl(provider.author_image_upload_path(id)), {
+    local ignored_body, err = self:httpRequest(self:buildServerUrl(provider.author_image_upload_path(id)), {
         method = "POST",
         headers = headers,
         source_factory = sourceFactory,
@@ -6773,7 +6773,7 @@ function GrimmorySync:startBookOrbitReconcile()
         return
     end
 
-    local StateManager, _, runtime_err = self:bookOrbitRuntime(false)
+    local StateManager, ignored_client, runtime_err = self:bookOrbitRuntime(false)
     if not StateManager then
         UIManager:show(InfoMessage:new{ text = runtime_err, timeout = 5 })
         return

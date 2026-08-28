@@ -133,6 +133,24 @@ end
 local Providers = require("providers/init")
 local plugin = dofile("main.lua")
 
+-- `_` is the gettext function throughout main.lua; ignored return values must
+-- not shadow it inside a function that later translates UI strings.
+local main_file = assert(io.open("main.lua", "rb"))
+local main_source = main_file:read("*a")
+main_file:close()
+for line in main_source:gmatch("[^\r\n]+") do
+    if not line:find('local _ = require("gettext")', 1, true) then
+        local declarations = line:match("^%s*local%s+([^=]+)%s*=")
+        if declarations then
+            for name in declarations:gmatch("[^,]+") do
+                if name:match("^%s*_%s*$") then
+                    error("local '_' shadows gettext: " .. line)
+                end
+            end
+        end
+    end
+end
+
 assert(Providers.get("grimmory").opds_root == "/api/v1/opds")
 assert(Providers.get("grimmory").api_credentials_separate == true)
 assert(Providers.get("bookorbit").book_api.endpoint == "/api/v1/books/query")
