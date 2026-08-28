@@ -50,6 +50,8 @@ Start with a restricted shelf, collection, or SmartScope if you want to verify t
 
 By default, sync only downloads missing books and never removes local files. Enable `Mirror selected sync source` only if you want Library Sync to move manifest-tracked books removed from the selected source, and older manifest-tracked duplicates of the same server book, to `<library>/.library-sync-trash/`.
 
+Mirror requires a complete paginated OPDS response with a verifiable total and usable downloads for every catalogue entry. It also asks for an additional confirmation before a large cleanup. If books need to be recovered, open `Library Sync -> Restore books from Mirror trash`. Restored files return to their original relative paths; existing destination files are skipped and never overwritten.
+
 ## Troubleshooting
 
 | Problem | Check |
@@ -62,6 +64,7 @@ By default, sync only downloads missing books and never removes local files. Ena
 | No books are downloaded | Confirm the selected sync source contains EPUB files and the local path is writable. |
 | Author images fail | Enable Bookshelf integration and verify API credentials. |
 | Author image upload fails | Use BookOrbit account credentials with permission to edit metadata. Existing server images and ambiguous matches are skipped. |
+| Books were moved by Mirror | Disable Mirror, then use `Restore books from Mirror trash`. Existing files are not overwritten. |
 
 KOReader's log is normally located at:
 

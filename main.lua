@@ -95,6 +95,8 @@ local MAX_HISTORY = 15
 local PROGRESS_STEP_DELAY_S = 0.2
 local AUTHOR_IMAGE_EXTS = { "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif" }
 local MIRROR_TRASH_DIR = ".library-sync-trash"
+local MIRROR_LARGE_CLEANUP_MIN_COUNT = 20
+local MIRROR_LARGE_CLEANUP_RATIO = 0.10
 local SIGNATURE_SEPARATOR = "\31"
 local ABORTED = "aborted"
 local SERVER_GRIMMORY = "grimmory"
@@ -1281,6 +1283,14 @@ function GrimmorySync:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Restore books from Mirror trash"),
+                callback = function(touchmenu_instance)
+                    self:runAfterMenuClose(touchmenu_instance, function()
+                        self:startMirrorTrashRestore()
+                    end)
+                end,
+            },
+            {
                 text = _("Show status"),
                 callback = function(touchmenu_instance)
                     self:runAfterMenuClose(touchmenu_instance, function()
@@ -2415,23 +2425,74 @@ function GrimmorySync:fetchBooklistFromServer()
     local current_link = catalog_link
     local page_count = 0
     local max_pages = 100  -- Safety limit to prevent infinite loops
+    local max_page_attempts = 3
+    local entries_seen = 0
+    local unusable_entries = 0
+    local total_results
+    local pagination_complete = false
+    local seen_page_links = {}
     
     while current_link and page_count < max_pages do
+        if seen_page_links[current_link] then
+            return nil, string.format(
+                _("OPDS pagination repeated the same page link. Sync stopped before making local changes: %s"),
+                tostring(current_link)
+            )
+        end
+        seen_page_links[current_link] = true
         page_count = page_count + 1
         logger.info("[GrimmorySync] Fetching page", page_count, ":", current_link)
         
-        local response, err = self:makeRequest(current_link)
+        local response, err
+        for attempt = 1, max_page_attempts do
+            response, err = self:makeRequest(current_link)
+            if response then break end
+            logger.warn(
+                "[GrimmorySync] OPDS page attempt failed:",
+                page_count,
+                "attempt:",
+                attempt,
+                "of:",
+                max_page_attempts,
+                "error:",
+                err or "unknown"
+            )
+        end
         if not response then
-            if page_count == 1 then
-                return nil, err  -- Fail if first page fails
-            else
-                logger.warn("[GrimmorySync] Failed to fetch page", page_count, ":", err)
-                break  -- Stop pagination but return what we have
+            logger.warn("[GrimmorySync] Failed to fetch page", page_count, ":", err)
+            return nil, string.format(
+                _("OPDS catalog page %d failed after %d entries. Sync stopped before making local changes: %s"),
+                page_count,
+                entries_seen,
+                tostring(err or _("unknown error"))
+            )
+        end
+
+        if not response:match("<feed[%s>]") then
+            return nil, string.format(
+                _("OPDS catalog page %d was not a valid Atom feed. Sync stopped before making local changes."),
+                page_count
+            )
+        end
+
+        local page_total = tonumber(
+            response:match("<opensearch:totalResults[^>]*>%s*(%d+)%s*</opensearch:totalResults>")
+                or response:match("<totalResults[^>]*>%s*(%d+)%s*</totalResults>")
+        )
+        if page_total then
+            if total_results and total_results ~= page_total then
+                return nil, string.format(
+                    _("OPDS catalog changed during pagination (%d to %d entries). Sync stopped before making local changes."),
+                    total_results,
+                    page_total
+                )
             end
+            total_results = page_total
         end
         
         -- Parse books from this page
         for entry in response:gmatch("<entry>(.-)</entry>") do
+            entries_seen = entries_seen + 1
             local title = xmlText(entry:match("<title[^>]*>(.-)</title>"))
             local author = xmlText(entry:match("<author>.-<name[^>]*>(.-)</name>.-</author>"))
             -- Try alternative author formats if first pattern doesn't match
@@ -2489,6 +2550,7 @@ function GrimmorySync:fetchBooklistFromServer()
                     download_url = download_link,
                 })
             elseif title then
+                unusable_entries = unusable_entries + 1
                 local acquisition_count = 0
                 for _, link in ipairs(self:opdsLinks(entry)) do
                     if self:isOpdsAcquisitionLink(link) then
@@ -2536,15 +2598,48 @@ function GrimmorySync:fetchBooklistFromServer()
             current_link = next_link
         else
             logger.info("[GrimmorySync] No more pages, stopping at page", page_count)
+            current_link = nil
+            pagination_complete = true
             break
         end
     end
     
-    if page_count >= max_pages then
-        logger.warn("[GrimmorySync] Reached maximum page limit (", max_pages, "), there may be more books")
+    if not pagination_complete then
+        logger.warn("[GrimmorySync] Reached maximum page limit (", max_pages, ") before pagination completed")
+        return nil, string.format(
+            _("OPDS catalog exceeded the %d-page safety limit. Sync stopped before making local changes."),
+            max_pages
+        )
+    end
+
+    if total_results and entries_seen ~= total_results then
+        return nil, string.format(
+            _("OPDS catalog was incomplete: received %d of %d entries. Sync stopped before making local changes."),
+            entries_seen,
+            total_results
+        )
+    end
+
+    if self.mirror_selected_sync_source == true and not total_results then
+        return nil, _("Mirror requires the OPDS feed to advertise a total result count. Sync stopped before making local changes because catalog completeness could not be verified.")
+    end
+
+    if self.mirror_selected_sync_source == true and unusable_entries > 0 then
+        return nil, string.format(
+            _("Mirror could not verify %d OPDS catalog entries as downloadable books. Sync stopped before making local changes."),
+            unusable_entries
+        )
     end
     
-    logger.info("[GrimmorySync] Found", #books, "remote books across", page_count, "pages")
+    logger.info(
+        "[GrimmorySync] Found",
+        #books,
+        "downloadable remote books from",
+        entries_seen,
+        "catalog entries across",
+        page_count,
+        "pages"
+    )
     return books, nil
 end
 
@@ -5206,13 +5301,42 @@ function GrimmorySync:uniquePath(path)
     return candidate
 end
 
-function GrimmorySync:moveBookToMirrorTrash(path)
+function GrimmorySync:newMirrorTrashBatchPath()
+    local root = self:mirrorTrashPath()
+    local base = root .. "/" .. os.date("%Y%m%d-%H%M%S")
+    local candidate = base
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local index = 1
+    while ok_lfs and lfs and lfs.attributes(candidate) do
+        candidate = base .. "-" .. tostring(index)
+        index = index + 1
+    end
+    return candidate
+end
+
+function GrimmorySync:mirrorRestoreMetadataPath(batch_path)
+    return tostring(batch_path or ""):gsub("/+$", "") .. "/.library-sync-restore.lua"
+end
+
+function GrimmorySync:saveMirrorRestoreMetadata(batch_path, books)
+    if type(batch_path) ~= "string" or batch_path == "" then return false end
+    local file = io.open(self:mirrorRestoreMetadataPath(batch_path), "w")
+    if not file then
+        logger.warn("[GrimmorySync] Could not save mirror restore metadata:", batch_path)
+        return false
+    end
+    file:write("return " .. dump({ version = 1, books = books or {} }) .. "\n")
+    file:close()
+    return true
+end
+
+function GrimmorySync:moveBookToMirrorTrash(path, trash_batch)
     if not self:isPathInsideLocalLibrary(path) or self:isMirrorTrashPath(path) then
         return false, _("Refusing to move a file outside the configured library path.")
     end
 
     local relative = self:relativeBookPath(path)
-    local trash_batch = self:mirrorTrashPath() .. "/" .. os.date("%Y%m%d-%H%M%S")
+    trash_batch = trash_batch or self:newMirrorTrashBatchPath()
     local destination = self:uniquePath(trash_batch .. "/" .. relative)
     local destination_dir = destination:match("(.+)/[^/]+$") or trash_batch
     if not self:ensureDirectory(destination_dir) then
@@ -5236,6 +5360,8 @@ function GrimmorySync:moveMirrorCleanupAsync(queue, manifest, done_callback)
     local skipped_open = 0
     local last_error
     manifest = manifest or self:loadManifest()
+    local trash_batch = self:newMirrorTrashBatchPath()
+    local restore_books = {}
 
     if total == 0 then
         done_callback(true, {
@@ -5265,7 +5391,7 @@ function GrimmorySync:moveMirrorCleanupAsync(queue, manifest, done_callback)
                 failed = failed,
                 skipped_open = skipped_open,
                 remaining = total - i,
-                trash_path = self:mirrorTrashPath(),
+                trash_path = trash_batch,
                 last_error = last_error,
             })
             return
@@ -5280,7 +5406,7 @@ function GrimmorySync:moveMirrorCleanupAsync(queue, manifest, done_callback)
                 failed = failed,
                 skipped_open = skipped_open,
                 remaining = 0,
-                trash_path = self:mirrorTrashPath(),
+                trash_path = trash_batch,
                 last_error = last_error,
             })
             return
@@ -5299,13 +5425,18 @@ function GrimmorySync:moveMirrorCleanupAsync(queue, manifest, done_callback)
             if self:isCurrentDocumentPath(item.path) then
                 skipped_open = skipped_open + 1
             else
-                local ok, destination_or_err = self:moveBookToMirrorTrash(item.path)
+                local manifest_entry = manifest.books[item.key]
+                local ok, destination_or_err = self:moveBookToMirrorTrash(item.path, trash_batch)
                 if ok then
                     moved = moved + 1
                     if item.reason == "duplicate" then
                         duplicates_moved = duplicates_moved + 1
                     else
                         removed_moved = removed_moved + 1
+                    end
+                    if type(manifest_entry) == "table" then
+                        restore_books[self:relativeBookPath(item.path)] = manifest_entry
+                        self:saveMirrorRestoreMetadata(trash_batch, restore_books)
                     end
                     manifest.books[item.key] = nil
                     logger.info(
@@ -5328,6 +5459,310 @@ function GrimmorySync:moveMirrorCleanupAsync(queue, manifest, done_callback)
     end
 
     UIManager:scheduleIn(PROGRESS_STEP_DELAY_S, step)
+end
+
+function GrimmorySync:loadMirrorRestoreMetadata(batch_path)
+    local ok, data = pcall(dofile, self:mirrorRestoreMetadataPath(batch_path))
+    if ok and type(data) == "table" and type(data.books) == "table" then
+        return data.books
+    end
+    return {}
+end
+
+function GrimmorySync:buildMirrorRestoreQueue()
+    local queue = {}
+    local stats = {
+        batches = 0,
+        found = 0,
+        conflicts = 0,
+        older_backups = 0,
+        invalid = 0,
+    }
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or not lfs then
+        return nil, stats, _("Could not load the filesystem library.")
+    end
+
+    local trash_root = self:mirrorTrashPath()
+    local root_attr = lfs.attributes(trash_root)
+    if not root_attr then
+        return queue, stats, nil
+    end
+    if root_attr.mode ~= "directory" then
+        return nil, stats, _("The Mirror trash path is not a directory.")
+    end
+
+    local batches = {}
+    local ok_dir, iterator, dir_obj = pcall(lfs.dir, trash_root)
+    if not ok_dir then
+        return nil, stats, tostring(iterator)
+    end
+    for entry in iterator, dir_obj do
+        if entry ~= "." and entry ~= ".." then
+            local path = trash_root .. "/" .. entry
+            local attr = lfs.attributes(path)
+            if attr and attr.mode == "directory" then
+                batches[#batches + 1] = { name = entry, path = path }
+            end
+        end
+    end
+    table.sort(batches, function(a, b) return a.name > b.name end)
+    stats.batches = #batches
+
+    local seen_destinations = {}
+    local function scanBatch(batch, path, relative_dir, restore_metadata)
+        local ok_scan, iter, scan_obj = pcall(lfs.dir, path)
+        if not ok_scan then
+            stats.invalid = stats.invalid + 1
+            logger.warn("[GrimmorySync] Could not scan Mirror trash directory:", path, iter)
+            return
+        end
+
+        for entry in iter, scan_obj do
+            if entry ~= "." and entry ~= ".." and entry ~= ".library-sync-restore.lua" then
+                local source = path .. "/" .. entry
+                local relative = relative_dir ~= "" and (relative_dir .. "/" .. entry) or entry
+                local attr = lfs.attributes(source)
+                if attr and attr.mode == "directory" then
+                    scanBatch(batch, source, relative, restore_metadata)
+                elseif attr and attr.mode == "file" and self:isEpubPath(source) then
+                    stats.found = stats.found + 1
+                    local destination = (self.local_path or DEFAULT_LOCAL_PATH):gsub("/+$", "") .. "/" .. relative
+                    local normalized_destination = self:normalizePathForCompare(destination)
+                    if not self:isPathInsideLocalLibrary(destination) or self:isMirrorTrashPath(destination) then
+                        stats.invalid = stats.invalid + 1
+                    elseif seen_destinations[normalized_destination] then
+                        stats.older_backups = stats.older_backups + 1
+                    elseif lfs.attributes(destination) then
+                        seen_destinations[normalized_destination] = true
+                        stats.conflicts = stats.conflicts + 1
+                    else
+                        seen_destinations[normalized_destination] = true
+                        queue[#queue + 1] = {
+                            source = source,
+                            destination = destination,
+                            relative = relative,
+                            batch = batch.path,
+                            manifest_entry = restore_metadata[relative] or restore_metadata[destination],
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    for _, batch in ipairs(batches) do
+        scanBatch(batch, batch.path, "", self:loadMirrorRestoreMetadata(batch.path))
+    end
+    return queue, stats, nil
+end
+
+function GrimmorySync:restoreBookFromMirrorTrash(item)
+    if type(item) ~= "table" or not item.source or not item.destination then
+        return false, _("Restore item is missing a source or destination path.")
+    end
+    if not self:isPathInsideLocalLibrary(item.destination) or self:isMirrorTrashPath(item.destination) then
+        return false, _("Refusing to restore a file outside the configured library path.")
+    end
+
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok_lfs and lfs and lfs.attributes(item.destination) then
+        return false, "conflict"
+    end
+    local destination_dir = item.destination:match("(.+)/[^/]+$")
+    if not destination_dir or not self:ensureDirectory(destination_dir) then
+        return false, _("Could not create the original book directory.")
+    end
+    local ok, err = os.rename(item.source, item.destination)
+    if not ok then
+        return false, err or _("Could not restore the book from Mirror trash.")
+    end
+    return true, nil
+end
+
+function GrimmorySync:restoreMirrorTrashAsync(queue, scan_stats, done_callback)
+    local total = #queue
+    local index = 0
+    local restored = 0
+    local failed = 0
+    local runtime_conflicts = 0
+    local skipped_open = 0
+    local last_error
+    local manifest = self:loadManifest()
+
+    local function finish(success, result)
+        self:saveManifest(manifest)
+        done_callback(success, result)
+    end
+
+    local function step()
+        if self.abort_sync then
+            finish(false, {
+                error = ABORTED,
+                restored = restored,
+                failed = failed,
+                conflicts = (scan_stats.conflicts or 0) + runtime_conflicts,
+                older_backups = scan_stats.older_backups or 0,
+                invalid = scan_stats.invalid or 0,
+                skipped_open = skipped_open,
+                remaining = total - index,
+                last_error = last_error,
+            })
+            return
+        end
+
+        index = index + 1
+        if index > total then
+            finish(true, {
+                restored = restored,
+                failed = failed,
+                conflicts = (scan_stats.conflicts or 0) + runtime_conflicts,
+                older_backups = scan_stats.older_backups or 0,
+                invalid = scan_stats.invalid or 0,
+                skipped_open = skipped_open,
+                remaining = 0,
+                last_error = last_error,
+            })
+            return
+        end
+
+        local item = queue[index]
+        self:showProgressDialog(string.format(
+            _("Restoring book %d of %d...\n\n%s\n\nRestored: %d\nFailed: %d\n\nTap Cancel to stop after the current file."),
+            index,
+            total,
+            item.relative or self:displayNameForPath(item.destination),
+            restored,
+            failed
+        ))
+
+        UIManager:scheduleIn(PROGRESS_STEP_DELAY_S, function()
+            if self:isCurrentDocumentPath(item.destination) then
+                skipped_open = skipped_open + 1
+            else
+                local ok, restore_err = self:restoreBookFromMirrorTrash(item)
+                if ok then
+                    restored = restored + 1
+                    if type(item.manifest_entry) == "table" then
+                        manifest.books[self:manifestKeyForPath(item.destination)] = item.manifest_entry
+                    end
+                elseif restore_err == "conflict" then
+                    runtime_conflicts = runtime_conflicts + 1
+                else
+                    failed = failed + 1
+                    last_error = restore_err
+                    logger.warn("[GrimmorySync] Mirror restore failed:", item.source, restore_err or "unknown")
+                end
+            end
+            self:saveManifest(manifest)
+            UIManager:scheduleIn(PROGRESS_STEP_DELAY_S, step)
+        end)
+    end
+
+    UIManager:scheduleIn(PROGRESS_STEP_DELAY_S, step)
+end
+
+function GrimmorySync:mirrorRestoreMessage(result, canceled)
+    result = result or {}
+    local title = canceled and _("Mirror trash restore stopped.") or _("Mirror trash restore complete.")
+    local message = string.format(
+        _("%s\n\nRestored: %d\nExisting destination skipped: %d\nOlder backup copies skipped: %d\nOpen books skipped: %d\nInvalid entries skipped: %d\nFailed: %d"),
+        title,
+        result.restored or 0,
+        result.conflicts or 0,
+        result.older_backups or 0,
+        result.skipped_open or 0,
+        result.invalid or 0,
+        result.failed or 0
+    )
+    if (result.failed or 0) > 0 and result.last_error then
+        message = message .. "\n\n" .. string.format(_("Latest error: %s"), tostring(result.last_error))
+    end
+    return message
+end
+
+function GrimmorySync:startMirrorTrashRestore()
+    if self.sync_running or self.auto_refresh_running then
+        UIManager:show(InfoMessage:new{
+            text = _("Library Sync is already running."),
+            timeout = 3,
+        })
+        return
+    end
+
+    self.sync_running = true
+    self.abort_sync = false
+    self.abort_notified = false
+    self:showProgressDialog(_("Scanning Mirror trash..."))
+
+    UIManager:scheduleIn(0, function()
+        local ok, queue, scan_stats, scan_err = pcall(function()
+            return self:buildMirrorRestoreQueue()
+        end)
+        self:closeProgressDialog()
+        if not ok then
+            self.sync_running = false
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("Mirror trash scan failed: %s"), tostring(queue)),
+                timeout = 6,
+            })
+            return
+        end
+        if not queue then
+            self.sync_running = false
+            UIManager:show(InfoMessage:new{
+                text = string.format(_("Mirror trash scan failed: %s"), tostring(scan_err or _("unknown error"))),
+                timeout = 6,
+            })
+            return
+        end
+        if #queue == 0 then
+            self.sync_running = false
+            UIManager:show(InfoMessage:new{
+                text = string.format(
+                    _("No restorable books found.\n\nExisting destinations: %d\nOlder backup copies: %d\nInvalid entries: %d\n\nTrash: %s"),
+                    scan_stats.conflicts or 0,
+                    scan_stats.older_backups or 0,
+                    scan_stats.invalid or 0,
+                    self:mirrorTrashPath()
+                ),
+                timeout = 8,
+            })
+            return
+        end
+
+        local confirm_dialog
+        confirm_dialog = ConfirmBox:new{
+            text = string.format(
+                _("Restore books from Mirror trash?\n\nRestorable: %d\nTrash batches: %d\nExisting destinations skipped: %d\nOlder backup copies skipped: %d\n\nBooks return to their original paths. Existing files are never overwritten."),
+                #queue,
+                scan_stats.batches or 0,
+                scan_stats.conflicts or 0,
+                scan_stats.older_backups or 0
+            ),
+            ok_text = _("Restore"),
+            cancel_text = _("Cancel"),
+            ok_callback = function()
+                pcall(function() UIManager:close(confirm_dialog) end)
+                self:restoreMirrorTrashAsync(queue, scan_stats, function(done_ok, result)
+                    self:closeProgressDialog()
+                    if (result and (result.restored or 0) > 0) then
+                        self:refreshFileBrowserContent()
+                    end
+                    UIManager:show(InfoMessage:new{
+                        text = self:mirrorRestoreMessage(result, not done_ok and result and result.error == ABORTED),
+                        timeout = 10,
+                    })
+                    self.sync_running = false
+                end)
+            end,
+            cancel_callback = function()
+                pcall(function() UIManager:close(confirm_dialog) end)
+                self.sync_running = false
+            end,
+        }
+        UIManager:show(confirm_dialog)
+    end)
 end
 
 function GrimmorySync:buildMissingBookQueue(local_books, remote_books)
@@ -6305,6 +6740,29 @@ function GrimmorySync:syncCompleteMessage(stats, downloaded, cleanup_result)
     return message .. self:apiMetadataWarning(stats.api_error)
 end
 
+function GrimmorySync:mirrorCleanupReasonCounts(queue)
+    local removed = 0
+    local duplicates = 0
+    for _, item in ipairs(queue or {}) do
+        if item.reason == "duplicate" then
+            duplicates = duplicates + 1
+        else
+            removed = removed + 1
+        end
+    end
+    return removed, duplicates
+end
+
+function GrimmorySync:isLargeMirrorCleanup(queue, local_count)
+    local count = #(queue or {})
+    if count == 0 then return false end
+    local_count = tonumber(local_count) or 0
+    local ratio_large = local_count > 0
+        and count >= 5
+        and (count / local_count) >= MIRROR_LARGE_CLEANUP_RATIO
+    return count >= MIRROR_LARGE_CLEANUP_MIN_COUNT or ratio_large
+end
+
 function GrimmorySync:performSync()
     if self.sync_running or self.auto_refresh_running then
         UIManager:show(InfoMessage:new{
@@ -6408,7 +6866,8 @@ function GrimmorySync:performSync()
     local cleanup_queue = stats.cleanup_queue or {}
     local cleanup_stats = stats.cleanup_stats or {}
 
-    local function finishWithMirrorCleanup(downloaded)
+    local function continueSync()
+      local function finishWithMirrorCleanup(downloaded)
         local function showResult(cleanup_result)
             cleanup_result = cleanup_result or {}
             cleanup_result.skipped_open = (cleanup_result.skipped_open or 0)
@@ -6452,14 +6911,14 @@ function GrimmorySync:performSync()
                 trash_path = self:mirrorTrashPath(),
             })
         end
-    end
+      end
 
-    if #missing == 0 then
-        finishWithMirrorCleanup(0)
-        return
-    end
+      if #missing == 0 then
+          finishWithMirrorCleanup(0)
+          return
+      end
 
-    self:downloadMissingBooksAsync(missing, stats.manifest, function(done_ok, result)
+      self:downloadMissingBooksAsync(missing, stats.manifest, function(done_ok, result)
         self:closeProgressDialog()
         result = result or {}
 
@@ -6484,8 +6943,43 @@ function GrimmorySync:performSync()
             return
         end
 
-        finishWithMirrorCleanup(result.downloaded or 0)
-    end)
+          finishWithMirrorCleanup(result.downloaded or 0)
+      end)
+    end
+
+    if self.mirror_selected_sync_source == true
+        and self:isLargeMirrorCleanup(cleanup_queue, stats.local_count) then
+        local removed_count, duplicate_count = self:mirrorCleanupReasonCounts(cleanup_queue)
+        local confirm_dialog
+        confirm_dialog = ConfirmBox:new{
+            text = string.format(
+                _("Large Mirror cleanup detected\n\nLocal books: %d\nServer books received: %d\nMove removed from source: %d\nMove tracked duplicates: %d\nTotal to move: %d\n\nNothing has been moved yet. Continue only if these numbers match your intended sync source."),
+                stats.local_count or 0,
+                stats.remote_count or 0,
+                removed_count,
+                duplicate_count,
+                #cleanup_queue
+            ),
+            ok_text = _("Continue"),
+            cancel_text = _("Cancel"),
+            ok_callback = function()
+                pcall(function() UIManager:close(confirm_dialog) end)
+                UIManager:scheduleIn(0, continueSync)
+            end,
+            cancel_callback = function()
+                pcall(function() UIManager:close(confirm_dialog) end)
+                self.sync_running = false
+                UIManager:show(InfoMessage:new{
+                    text = _("Sync canceled before downloads or Mirror cleanup."),
+                    timeout = 4,
+                })
+            end,
+        }
+        UIManager:show(confirm_dialog)
+        return
+    end
+
+    continueSync()
 end
 
 function GrimmorySync:performMetadataRefreshForFile(file_path)

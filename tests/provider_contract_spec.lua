@@ -298,12 +298,88 @@ plugin.makeRequest = function(_, endpoint)
 end
 plugin.selected_feed = ""
 plugin.selected_feed_label = ""
+plugin.mirror_selected_sync_source = false
 local parsed_books = assert(plugin:fetchBooklistFromServer())
 assert(#parsed_books == 1)
 assert(parsed_books[1].book_id == "42")
 assert(parsed_books[1].series == "Apollo")
 assert(parsed_books[1].series_index == "2")
 assert(parsed_books[1].download_url == "/api/v1/opds/42/download?fileId=9")
+
+local paginated_first_page = catalog_feed:gsub(
+    "</feed>",
+    '<link rel="next" href="/api/v1/opds/catalog?page=2&amp;size=50"/></feed>'
+)
+plugin.makeRequest = function(_, endpoint)
+    if endpoint == "/api/v1/opds" then return root_feed, nil end
+    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return paginated_first_page, nil end
+    if endpoint == "/api/v1/opds/catalog?page=2&size=50" then return nil, "HTTP 503" end
+    return nil, "unexpected endpoint"
+end
+local partial_books, partial_err = plugin:fetchBooklistFromServer()
+assert(partial_books == nil)
+assert(partial_err:match("page 2"))
+assert(partial_err:match("before making local changes"))
+
+local retry_attempts = 0
+local retry_second_page = catalog_feed:gsub("42", "43")
+plugin.makeRequest = function(_, endpoint)
+    if endpoint == "/api/v1/opds" then return root_feed, nil end
+    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return paginated_first_page, nil end
+    if endpoint == "/api/v1/opds/catalog?page=2&size=50" then
+        retry_attempts = retry_attempts + 1
+        if retry_attempts == 1 then return nil, "HTTP 503" end
+        return retry_second_page, nil
+    end
+    return nil, "unexpected endpoint"
+end
+local retried_books = assert(plugin:fetchBooklistFromServer())
+assert(retry_attempts == 2)
+assert(#retried_books == 2)
+
+local incomplete_total_feed = catalog_feed:gsub(
+    "<feed>",
+    '<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"><opensearch:totalResults>2</opensearch:totalResults>'
+)
+plugin.makeRequest = function(_, endpoint)
+    if endpoint == "/api/v1/opds" then return root_feed, nil end
+    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return incomplete_total_feed, nil end
+    return nil, "unexpected endpoint"
+end
+local incomplete_books, incomplete_err = plugin:fetchBooklistFromServer()
+assert(incomplete_books == nil)
+assert(incomplete_err:match("received 1 of 2 entries"))
+
+plugin.mirror_selected_sync_source = true
+plugin.makeRequest = function(_, endpoint)
+    return responses[endpoint], responses[endpoint] and nil or "unexpected endpoint"
+end
+local unverified_books, unverified_err = plugin:fetchBooklistFromServer()
+assert(unverified_books == nil)
+assert(unverified_err:match("total result count"))
+
+local unusable_feed = [[
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <entry>
+    <title>Unavailable book</title>
+    <id>urn:bookorbit:book:99</id>
+  </entry>
+</feed>
+]]
+plugin.makeRequest = function(_, endpoint)
+    if endpoint == "/api/v1/opds" then return root_feed, nil end
+    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return unusable_feed, nil end
+    return nil, "unexpected endpoint"
+end
+local unusable_books, unusable_err = plugin:fetchBooklistFromServer()
+assert(unusable_books == nil)
+assert(unusable_err:match("1 OPDS catalog entries"))
+plugin.mirror_selected_sync_source = false
+
+plugin.makeRequest = function(_, endpoint)
+    return responses[endpoint], responses[endpoint] and nil or "unexpected endpoint"
+end
 
 local bookorbit = Providers.get("bookorbit")
 local original_book_page_size = bookorbit.book_api.page_size
@@ -560,6 +636,42 @@ assert(#duplicate_cleanup == 1)
 assert(duplicate_cleanup[1].path == old_volume_path)
 assert(duplicate_cleanup[1].reason == "duplicate")
 assert(duplicate_stats.duplicate_candidates == 1)
+assert(plugin:isLargeMirrorCleanup(duplicate_cleanup, 3) == false)
+local large_cleanup = {}
+for i = 1, 20 do large_cleanup[i] = { reason = "removed" } end
+assert(plugin:isLargeMirrorCleanup(large_cleanup, 3000) == true)
+assert(plugin:isLargeMirrorCleanup({ {}, {}, {}, {}, {} }, 10) == true)
+assert(plugin:isLargeMirrorCleanup({ {}, {}, {}, {} }, 100) == false)
+
+local trash_root = "/library/.library-sync-trash"
+local new_batch = trash_root .. "/20260828-100000"
+local old_batch = trash_root .. "/20260828-090000"
+fake_dirs[trash_root] = true
+fake_dirs[new_batch] = true
+fake_dirs[old_batch] = true
+fake_dirs[new_batch .. "/Fiction"] = true
+fake_dirs[new_batch .. "/Manga"] = true
+fake_dirs[old_batch .. "/Fiction"] = true
+fake_dir_entries[trash_root] = { ".", "..", "20260828-090000", "20260828-100000" }
+fake_dir_entries[new_batch] = { ".", "..", ".library-sync-restore.lua", "Fiction", "Manga" }
+fake_dir_entries[old_batch] = { ".", "..", "Fiction" }
+fake_dir_entries[new_batch .. "/Fiction"] = { ".", "..", "Min kamp 6.epub" }
+fake_dir_entries[new_batch .. "/Manga"] = { ".", "..", "Existing.epub" }
+fake_dir_entries[old_batch .. "/Fiction"] = { ".", "..", "Min kamp 6.epub" }
+fake_files[new_batch .. "/Fiction/Min kamp 6.epub"] = true
+fake_files[new_batch .. "/Manga/Existing.epub"] = true
+fake_files[old_batch .. "/Fiction/Min kamp 6.epub"] = true
+fake_files["/library/Manga/Existing.epub"] = true
+
+local restore_queue, restore_stats, restore_err = plugin:buildMirrorRestoreQueue()
+assert(restore_queue, tostring(restore_err))
+assert(#restore_queue == 1)
+assert(restore_queue[1].source == new_batch .. "/Fiction/Min kamp 6.epub")
+assert(restore_queue[1].destination == "/library/Fiction/Min kamp 6.epub")
+assert(restore_stats.batches == 2)
+assert(restore_stats.found == 3)
+assert(restore_stats.conflicts == 1)
+assert(restore_stats.older_backups == 1)
 
 plugin.loadManifest = original_load_manifest
 plugin.saveManifest = original_save_manifest
