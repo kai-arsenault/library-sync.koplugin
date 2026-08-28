@@ -99,6 +99,7 @@ local MIRROR_LARGE_CLEANUP_MIN_COUNT = 20
 local MIRROR_LARGE_CLEANUP_RATIO = 0.10
 local METADATA_LARGE_REFRESH_MIN_COUNT = 100
 local METADATA_LARGE_REFRESH_RATIO = 0.25
+local BOOKORBIT_LINK_BATCH_SIZE = 100
 local BOOKORBIT_MATCH_BATCH_SIZE = 100
 local BOOKORBIT_RECONCILE_HASH_BATCH_SIZE = 25
 local SIGNATURE_SEPARATOR = "\31"
@@ -1414,7 +1415,9 @@ function GrimmorySync:getBookOrbitIntegrationMenu()
             text = _("Register existing Library Sync books"),
             callback = function(touchmenu_instance)
                 self:runAfterMenuClose(touchmenu_instance, function()
-                    self:startBookOrbitReconcile()
+                    self:runBookOrbitProtected(function()
+                        self:startBookOrbitReconcile()
+                    end)
                 end)
             end,
         },
@@ -1423,6 +1426,22 @@ function GrimmorySync:getBookOrbitIntegrationMenu()
             enabled = false,
         },
     }
+end
+
+function GrimmorySync:runBookOrbitProtected(callback, cleanup)
+    local ok, err = xpcall(callback, debug.traceback)
+    if ok then return true end
+
+    logger.err("[GrimmorySync] BookOrbit integration failed:", tostring(err))
+    if cleanup then pcall(cleanup) end
+    UIManager:show(InfoMessage:new{
+        text = string.format(
+            _("BookOrbit registration failed safely. No reading status was changed.\n\n%s"),
+            tostring(err)
+        ),
+        timeout = 10,
+    })
+    return false, err
 end
 
 function GrimmorySync:getAutomaticMetadataRefreshMenu()
@@ -3826,18 +3845,26 @@ function GrimmorySync:flushBookOrbitRegistrationQueue(manifest)
         end
     end
 
-    if #direct > 0 then
-        local ok_link, link_err = pcall(StateManager.linkFiles, direct)
-        if not ok_link then
-            for _, item in ipairs(items) do self.bookorbit_link_queue[item.path] = item end
-            result.failed = #items
-            result.error = tostring(link_err)
+    for first = 1, #direct, BOOKORBIT_LINK_BATCH_SIZE do
+        local last = math.min(first + BOOKORBIT_LINK_BATCH_SIZE - 1, #direct)
+        local batch = {}
+        for index = first, last do batch[#batch + 1] = direct[index] end
+        local ok_link, link_result, link_err = pcall(StateManager.linkFiles, batch)
+        if not ok_link or link_result == nil then
+            for index = first, #direct_items do
+                local item = direct_items[index]
+                self.bookorbit_link_queue[item.path] = item
+            end
+            for _, item in ipairs(fallback) do self.bookorbit_link_queue[item.path] = item end
+            result.failed = result.failed + (#direct - first + 1) + #fallback
+            result.error = tostring(ok_link and link_err or link_result)
             return false, result
         end
-        for index, link in ipairs(direct) do
+        for index = first, last do
+            local link = direct[index]
             self:updateManifestBookOrbitLink(manifest, direct_items[index], link)
         end
-        result.linked = result.linked + #direct
+        result.linked = result.linked + #batch
     end
 
     if #fallback > 0 then
@@ -3890,14 +3917,14 @@ function GrimmorySync:flushBookOrbitRegistrationQueue(manifest)
                 end
             end
             if #links > 0 then
-                local ok_link, link_err = pcall(StateManager.linkFiles, links)
-                if not ok_link then
+                local ok_link, link_result, link_err = pcall(StateManager.linkFiles, links)
+                if not ok_link or link_result == nil then
                     for index = first, #fallback do
                         local item = fallback[index]
                         self.bookorbit_link_queue[item.path] = item
                     end
                     result.failed = result.failed + (last - first + 1)
-                    result.error = tostring(link_err)
+                    result.error = tostring(ok_link and link_err or link_result)
                     return false, result
                 end
                 for _, link in ipairs(links) do
@@ -6773,7 +6800,12 @@ function GrimmorySync:startBookOrbitReconcile()
         ok_callback = function()
             pcall(function() UIManager:close(confirm_dialog) end)
             UIManager:scheduleIn(0, function()
-                self:performBookOrbitReconcile(manifest, candidates, StateManager)
+                self:runBookOrbitProtected(function()
+                    self:performBookOrbitReconcile(manifest, candidates, StateManager)
+                end, function()
+                    self:closeProgressDialog()
+                    self.sync_running = false
+                end)
             end)
         end,
     }
@@ -6843,7 +6875,15 @@ function GrimmorySync:performBookOrbitReconcile(manifest, candidates, StateManag
         UIManager:show(InfoMessage:new{ text = message, timeout = 8 })
     end
 
-    local function step()
+    local step
+    local function safeStep()
+        self:runBookOrbitProtected(step, function()
+            self:closeProgressDialog()
+            self.sync_running = false
+        end)
+    end
+
+    step = function()
         if self.abort_sync then
             finish(true)
             return
@@ -6897,11 +6937,11 @@ function GrimmorySync:performBookOrbitReconcile(manifest, candidates, StateManag
         if index >= #candidates then
             finish(false)
         else
-            UIManager:scheduleIn(0, step)
+            UIManager:scheduleIn(0, safeStep)
         end
     end
 
-    UIManager:scheduleIn(0, step)
+    UIManager:scheduleIn(0, safeStep)
 end
 
 function GrimmorySync:requestAbort(message)

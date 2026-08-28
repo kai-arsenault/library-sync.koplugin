@@ -19,6 +19,7 @@ local fake_files = {}
 local fake_dirs = {}
 local fake_dir_entries = {}
 local bookorbit_links = {}
+local bookorbit_link_batch_sizes = {}
 package.preload["util"] = function()
     return {
         partialMD5 = function(path)
@@ -29,6 +30,7 @@ end
 package.preload["bookorbit_state_manager"] = function()
     return {
         linkFiles = function(entries)
+            bookorbit_link_batch_sizes[#bookorbit_link_batch_sizes + 1] = #(entries or {})
             for _, entry in ipairs(entries or {}) do
                 bookorbit_links[#bookorbit_links + 1] = entry
             end
@@ -345,6 +347,34 @@ assert(bookorbit_links[1].bookFileId == 9)
 assert(bookorbit_links[1].file == linked_path)
 assert(bookorbit_links[1].digest == "digest:" .. linked_path)
 assert(linked_manifest.books[linked_path].bookorbit_digest == "digest:" .. linked_path)
+
+bookorbit_links = {}
+bookorbit_link_batch_sizes = {}
+local bulk_manifest = { books = {} }
+plugin.bookorbit_link_queue = {}
+for index = 1, 205 do
+    local path = "/library/bulk-" .. index .. ".epub"
+    local book = {
+        book_id = tostring(1000 + index),
+        book_file_id = tostring(2000 + index),
+        title = "Bulk " .. index,
+    }
+    bulk_manifest.books[path] = {}
+    plugin.bookorbit_link_queue[path] = {
+        path = path,
+        digest = "bulk-digest-" .. index,
+        book = book,
+        size = 10,
+    }
+end
+local bulk_ok, bulk_result = plugin:flushBookOrbitRegistrationQueue(bulk_manifest)
+assert(bulk_ok == true)
+assert(bulk_result.linked == 205)
+assert(#bookorbit_links == 205)
+assert(#bookorbit_link_batch_sizes == 3)
+assert(bookorbit_link_batch_sizes[1] == 100)
+assert(bookorbit_link_batch_sizes[2] == 100)
+assert(bookorbit_link_batch_sizes[3] == 5)
 
 local legacy_bookorbit_entry = {
     remote_key = "id:42",
