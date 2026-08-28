@@ -454,6 +454,36 @@ local upload_api_authors = assert(plugin:fetchAuthorsFromServer(
     "test upload"
 ))
 assert(#upload_api_authors == 3)
+
+assert(plugin:metadataRefreshApiGuard(false, "HTTP 503", 200):match("stopped before replacing"))
+assert(plugin:metadataRefreshApiGuard(true, 190, 200) == nil)
+assert(plugin:metadataRefreshApiGuard(true, 189, 200):match("matched only 189 of 200"))
+local saved_api_username, saved_api_password = plugin.api_username, plugin.api_password
+plugin.api_username, plugin.api_password = "", ""
+assert(plugin:metadataRefreshApiGuard(false, "HTTP 401", 200) == nil)
+plugin.api_username, plugin.api_password = saved_api_username, saved_api_password
+local metadata_queue_100 = {}
+for i = 1, 100 do metadata_queue_100[i] = {} end
+local metadata_queue_25 = {}
+for i = 1, 25 do metadata_queue_25[i] = {} end
+local metadata_queue_99 = {}
+for i = 1, 99 do metadata_queue_99[i] = {} end
+assert(plugin:isLargeMetadataRefresh(metadata_queue_100, 1000) == true)
+assert(plugin:isLargeMetadataRefresh(metadata_queue_25, 100) == true)
+assert(plugin:isLargeMetadataRefresh(metadata_queue_99, 1000) == false)
+
+decoded_json["book-incomplete-page-0"] = { items = { { id = 1 }, { id = 2 } }, total = 3 }
+decoded_json["book-incomplete-page-1"] = { items = {}, total = 3 }
+plugin.httpRequest = function(_, url, options)
+    if url:match("/books/query$") then
+        return options.body:match('"page":1') and "book-incomplete-page-1" or "book-incomplete-page-0", nil
+    end
+    return nil, "unexpected URL: " .. tostring(url)
+end
+local incomplete_api_books, incomplete_api_err = plugin:fetchBookMetadataFromServerApi("token")
+assert(incomplete_api_books == nil)
+assert(incomplete_api_err:match("received 2 of 3 books"))
+
 bookorbit.book_api.page_size = original_book_page_size
 bookorbit.author_api.page_size = original_author_page_size
 bookorbit.author_upload_api.page_size = original_upload_author_page_size

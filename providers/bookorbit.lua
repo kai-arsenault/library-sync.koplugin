@@ -10,6 +10,7 @@ return {
         endpoint = "/api/v1/books/query",
         paginated = true,
         page_size = 200,
+        minimum_match_ratio = 0.95,
     },
     author_api = {
         endpoint = "/api/v1/authors?hasPhoto=true&sort=name&order=asc",

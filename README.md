@@ -178,6 +178,8 @@ Menu -> Magnifying glass -> Library Sync -> Refresh existing metadata
 
 The first metadata refresh records the current state in `library_sync_manifest.lua` and may refresh previously untracked books once. Later runs skip unchanged books. Replacements are downloaded to a temporary file, checked for non-zero size, and moved into place only after the existing file has been backed up. Existing `grimmory_sync_manifest.lua` files are read as migration fallbacks.
 
+When configured API metadata cannot be loaded completely, metadata refresh stops before replacing local files instead of comparing a degraded OPDS-only state with previously enriched signatures. An unusually large manual refresh queue requires a second confirmation with exact counts.
+
 The currently open book is skipped. To refresh one EPUB, long-press it in KOReader's file browser and choose `Refresh server metadata`. To refresh the open book, use `Refresh open book metadata`; Library Sync will ask before closing it.
 
 ## SimpleUI Actions
@@ -197,6 +199,8 @@ Automatic refresh is off by default. Available options are:
 - `Check at startup`
 - `Check interval`
 - `Use OPDS updated timestamp as refresh trigger`
+
+Automatic refresh stops without replacing files when its queue is unusually large. Run a manual refresh to inspect and confirm that queue.
 
 Automatic checks scan the local library and contact the server, so they consume more battery than manual-only use. Timers stop while KOReader is suspended and restart on resume.
 

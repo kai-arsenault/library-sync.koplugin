@@ -60,6 +60,7 @@ Mirror requires a complete paginated OPDS response with a verifiable total. Non-
 | Connection fails | Confirm the device can reach the server origin over the network. |
 | OPDS returns 401 | Use OPDS credentials, not normal server account credentials. |
 | Extra metadata is absent | Configure the optional normal server account credentials. |
+| Metadata refresh unexpectedly selects most books | Cancel it. Update Library Sync, verify API credentials, then retry; large queues require a second confirmation. |
 | Extra metadata fails behind a proxy or tunnel | Use the public `https://` server URL. |
 | No books are downloaded | Confirm the selected sync source contains EPUB files and the local path is writable. |
 | Author images fail | Enable Bookshelf integration and verify API credentials. |

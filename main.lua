@@ -97,6 +97,8 @@ local AUTHOR_IMAGE_EXTS = { "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", 
 local MIRROR_TRASH_DIR = ".library-sync-trash"
 local MIRROR_LARGE_CLEANUP_MIN_COUNT = 20
 local MIRROR_LARGE_CLEANUP_RATIO = 0.10
+local METADATA_LARGE_REFRESH_MIN_COUNT = 100
+local METADATA_LARGE_REFRESH_RATIO = 0.25
 local SIGNATURE_SEPARATOR = "\31"
 local ABORTED = "aborted"
 local SERVER_GRIMMORY = "grimmory"
@@ -4081,6 +4083,7 @@ function GrimmorySync:fetchBookMetadataFromServerApi(token)
     local page = 0
     local page_size = api.page_size or 200
     local books = {}
+    local expected_total
     while true do
         local body = string.format(
             '{"sort":[{"field":"title","dir":"asc"}],"pagination":{"page":%d,"size":%d},"collapseSeries":false}',
@@ -4109,10 +4112,42 @@ function GrimmorySync:fetchBookMetadataFromServerApi(token)
         end
 
         local total = tonumber(data.total)
-        if #page_books < page_size or (total and #books >= total) then
+        if total then
+            if expected_total and expected_total ~= total then
+                return nil, string.format(
+                    _("The %s book API total changed during pagination (%d to %d)."),
+                    self:serverName(),
+                    expected_total,
+                    total
+                )
+            end
+            expected_total = total
+        end
+
+        if expected_total and #books >= expected_total then
+            break
+        end
+        if #page_books < page_size then
+            if expected_total and #books ~= expected_total then
+                return nil, string.format(
+                    _("The %s book API response was incomplete: received %d of %d books."),
+                    self:serverName(),
+                    #books,
+                    expected_total
+                )
+            end
             break
         end
         page = page + 1
+    end
+
+    if expected_total and #books ~= expected_total then
+        return nil, string.format(
+            _("The %s book API response was incomplete: received %d of %d books."),
+            self:serverName(),
+            #books,
+            expected_total
+        )
     end
 
     return books, nil
@@ -4265,6 +4300,51 @@ function GrimmorySync:enrichRemoteBooksWithBookApiMetadata(remote_books)
 
     local count = self:applyBookApiMetadata(remote_books, api_books)
     return true, count
+end
+
+function GrimmorySync:metadataRefreshApiGuard(enriched, enrich_result, remote_count)
+    remote_count = tonumber(remote_count) or 0
+    local provider = self:provider()
+    local api = provider.book_api or {}
+    local credential_candidates = self:apiCredentialCandidates()
+    local api_username, api_password = self:apiCredentials()
+    local configured_api_expected = #credential_candidates > 0
+        and (provider.api_credentials_separate ~= true
+            or (api_username ~= "" and api_password ~= ""))
+
+    if not enriched then
+        if not configured_api_expected then
+            return nil
+        end
+        return string.format(
+            _("Metadata refresh stopped before replacing local files because extra %s metadata could not be loaded: %s"),
+            self:serverName(),
+            tostring(enrich_result or _("unknown error"))
+        )
+    end
+
+    local minimum_ratio = tonumber(api.minimum_match_ratio)
+    local matched = tonumber(enrich_result) or 0
+    if minimum_ratio and remote_count > 0 and (matched / remote_count) < minimum_ratio then
+        return string.format(
+            _("Metadata refresh stopped before replacing local files because %s matched only %d of %d OPDS EPUBs to API metadata."),
+            self:serverName(),
+            matched,
+            remote_count
+        )
+    end
+
+    return nil
+end
+
+function GrimmorySync:isLargeMetadataRefresh(queue, local_count)
+    local count = #(queue or {})
+    if count == 0 then return false end
+    local_count = tonumber(local_count) or 0
+    local ratio_large = local_count > 0
+        and count >= 20
+        and (count / local_count) >= METADATA_LARGE_REFRESH_RATIO
+    return count >= METADATA_LARGE_REFRESH_MIN_COUNT or ratio_large
 end
 
 function GrimmorySync:extractAuthorsArray(data)
@@ -6479,12 +6559,24 @@ function GrimmorySync:performAutomaticMetadataRefresh(reason)
         if enriched then
             logger.info("[GrimmorySync] Automatic refresh API metadata applied:", enrich_result)
         else
-            logger.warn("[GrimmorySync] Automatic refresh continuing without Book API metadata:", enrich_result)
+            logger.warn("[GrimmorySync] Automatic refresh could not load Book API metadata:", enrich_result)
+        end
+        local api_guard_error = self:metadataRefreshApiGuard(enriched, enrich_result, #remote_books)
+        if api_guard_error then
+            return false, api_guard_error
         end
 
         local matched, skipped, manifest, queue_stats = self:buildMetadataRefreshQueue(local_books, remote_books, {
             skip_open_book = true,
         })
+
+        if self:isLargeMetadataRefresh(matched, #local_books) then
+            return false, string.format(
+                _("Suspiciously large metadata queue (%d of %d local books). Run a manual metadata refresh to review and confirm it."),
+                #matched,
+                #local_books
+            )
+        end
 
         return true, {
             matched = matched,
@@ -7063,8 +7155,12 @@ function GrimmorySync:performMetadataRefreshForFile(file_path)
         if enriched then
             logger.info("[GrimmorySync] Book API metadata applied:", enrich_result)
         else
-            logger.warn("[GrimmorySync] Continuing without Book API metadata:", enrich_result)
+            logger.warn("[GrimmorySync] Could not load Book API metadata:", enrich_result)
             api_error = enrich_result
+        end
+        local api_guard_error = self:metadataRefreshApiGuard(enriched, enrich_result, #remote_books)
+        if api_guard_error then
+            return false, api_guard_error
         end
 
         if self.abort_sync then
@@ -7240,8 +7336,12 @@ function GrimmorySync:performMetadataRefresh()
         if enriched then
             logger.info("[GrimmorySync] Book API metadata applied:", enrich_result)
         else
-            logger.warn("[GrimmorySync] Continuing without Book API metadata:", enrich_result)
+            logger.warn("[GrimmorySync] Could not load Book API metadata:", enrich_result)
             api_error = enrich_result
+        end
+        local api_guard_error = self:metadataRefreshApiGuard(enriched, enrich_result, #remote_books)
+        if api_guard_error then
+            return false, api_guard_error
         end
 
         if self.abort_sync then
@@ -7329,34 +7429,69 @@ function GrimmorySync:performMetadataRefresh()
         return
     end
 
-    self:refreshExistingMetadataAsync(matched, stats.skipped or 0, stats.manifest, function(done_ok, result)
-        self:closeProgressDialog()
-        result = result or {}
-        result.skipped_open = (result.skipped_open or 0)
-            + ((stats.queue_stats and stats.queue_stats.skipped_open) or 0)
-        if not done_ok then
-            if result.error == ABORTED then
-                UIManager:show(InfoMessage:new{
-                    text = string.format(
-                        _("Metadata refresh canceled.\n\nUpdated: %d books\nRemaining: %d books"),
-                        result.refreshed or 0,
-                        result.remaining or 0
-                    ),
-                    timeout = 5,
-                })
-            else
-                UIManager:show(InfoMessage:new{
-                    text = string.format(_("Error: %s"), tostring(result.error or _("unknown"))),
-                    timeout = 5,
-                })
-                logger.err("[GrimmorySync] Metadata refresh error:", result.error)
+    local function continueMetadataRefresh()
+        self:refreshExistingMetadataAsync(matched, stats.skipped or 0, stats.manifest, function(done_ok, result)
+            self:closeProgressDialog()
+            result = result or {}
+            result.skipped_open = (result.skipped_open or 0)
+                + ((stats.queue_stats and stats.queue_stats.skipped_open) or 0)
+            if not done_ok then
+                if result.error == ABORTED then
+                    UIManager:show(InfoMessage:new{
+                        text = string.format(
+                            _("Metadata refresh canceled.\n\nUpdated: %d books\nRemaining: %d books"),
+                            result.refreshed or 0,
+                            result.remaining or 0
+                        ),
+                        timeout = 5,
+                    })
+                else
+                    UIManager:show(InfoMessage:new{
+                        text = string.format(_("Error: %s"), tostring(result.error or _("unknown"))),
+                        timeout = 5,
+                    })
+                    logger.err("[GrimmorySync] Metadata refresh error:", result.error)
+                end
+                self.sync_running = false
+                return
             end
-            self.sync_running = false
-            return
-        end
 
-        finishWithAuthorImages(result)
-    end, { skip_open_book = true })
+            finishWithAuthorImages(result)
+        end, { skip_open_book = true })
+    end
+
+    if self:isLargeMetadataRefresh(matched, stats.local_count) then
+        local queue_stats = stats.queue_stats or {}
+        local confirm_dialog
+        confirm_dialog = ConfirmBox:new{
+            text = string.format(
+                _("Large metadata refresh detected\n\nLocal books: %d\nServer EPUBs: %d\nMetadata changes: %d\nOPDS timestamp changes: %d\nTotal to replace: %d\n\nNothing has been replaced yet. Continue only if you expect this many books to have changed."),
+                stats.local_count or 0,
+                stats.remote_count or 0,
+                queue_stats.metadata_changed or 0,
+                queue_stats.opds_timestamp_changed or 0,
+                #matched
+            ),
+            ok_text = _("Continue"),
+            cancel_text = _("Cancel"),
+            ok_callback = function()
+                pcall(function() UIManager:close(confirm_dialog) end)
+                UIManager:scheduleIn(0, continueMetadataRefresh)
+            end,
+            cancel_callback = function()
+                pcall(function() UIManager:close(confirm_dialog) end)
+                self.sync_running = false
+                UIManager:show(InfoMessage:new{
+                    text = _("Metadata refresh canceled before replacing local files."),
+                    timeout = 4,
+                })
+            end,
+        }
+        UIManager:show(confirm_dialog)
+        return
+    end
+
+    continueMetadataRefresh()
 end
 
 function GrimmorySync:showStatus()
