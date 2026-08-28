@@ -2427,7 +2427,9 @@ function GrimmorySync:fetchBooklistFromServer()
     local max_pages = 100  -- Safety limit to prevent infinite loops
     local max_page_attempts = 3
     local entries_seen = 0
-    local unusable_entries = 0
+    local unsupported_entries = 0
+    local unidentified_entries = 0
+    local catalog_remote_keys = {}
     local total_results
     local pagination_complete = false
     local seen_page_links = {}
@@ -2506,8 +2508,28 @@ function GrimmorySync:fetchBooklistFromServer()
             local description = xmlText(entry:match("<summary[^>]*>(.-)</summary>")
                 or entry:match("<content[^>]*>(.-)</content>"))
 
+            local acquisition_links = {}
+            for _, link in ipairs(self:opdsLinks(entry)) do
+                if self:isOpdsAcquisitionLink(link) then
+                    acquisition_links[#acquisition_links + 1] = link
+                end
+            end
             local acquisition_link = self:opdsAcquisitionLink(entry, title)
             local download_link = acquisition_link and acquisition_link.href or nil
+            local identity_link = download_link
+                or (acquisition_links[1] and acquisition_links[1].href)
+            local book_id = self:bookIdFromOpds(entry, identity_link)
+            local catalog_key = self:remoteBookKey({
+                book_id = book_id,
+                download_url = identity_link,
+                title = title,
+                author = author,
+            })
+            if catalog_key then
+                catalog_remote_keys[catalog_key] = true
+            else
+                unidentified_entries = unidentified_entries + 1
+            end
             
             -- Extract genres/tags (category elements)
             local genres = {}
@@ -2529,7 +2551,6 @@ function GrimmorySync:fetchBooklistFromServer()
             end
             
             if title and download_link then
-                local book_id = self:bookIdFromOpds(entry, download_link)
                 local opds_file_name = self:fileNameFromOpdsLink(acquisition_link)
                 if not book_id then
                     logger.warn("[GrimmorySync] Book ID missing from OPDS entry:", title, "download:", download_link)
@@ -2550,18 +2571,12 @@ function GrimmorySync:fetchBooklistFromServer()
                     download_url = download_link,
                 })
             elseif title then
-                unusable_entries = unusable_entries + 1
-                local acquisition_count = 0
-                for _, link in ipairs(self:opdsLinks(entry)) do
-                    if self:isOpdsAcquisitionLink(link) then
-                        acquisition_count = acquisition_count + 1
-                    end
-                end
+                unsupported_entries = unsupported_entries + 1
                 logger.warn(
                     "[GrimmorySync] Book without usable download link:",
                     title,
                     "acquisition_links:",
-                    acquisition_count
+                    #acquisition_links
                 )
             end
         end
@@ -2624,13 +2639,13 @@ function GrimmorySync:fetchBooklistFromServer()
         return nil, _("Mirror requires the OPDS feed to advertise a total result count. Sync stopped before making local changes because catalog completeness could not be verified.")
     end
 
-    if self.mirror_selected_sync_source == true and unusable_entries > 0 then
+    if self.mirror_selected_sync_source == true and unidentified_entries > 0 then
         return nil, string.format(
-            _("Mirror could not verify %d OPDS catalog entries as downloadable books. Sync stopped before making local changes."),
-            unusable_entries
+            _("Mirror could not identify %d OPDS catalog entries. Sync stopped before making local changes."),
+            unidentified_entries
         )
     end
-    
+
     logger.info(
         "[GrimmorySync] Found",
         #books,
@@ -2640,7 +2655,14 @@ function GrimmorySync:fetchBooklistFromServer()
         page_count,
         "pages"
     )
-    return books, nil
+    return books, nil, {
+        entries_seen = entries_seen,
+        total_results = total_results,
+        page_count = page_count,
+        unsupported_entries = unsupported_entries,
+        unidentified_entries = unidentified_entries,
+        remote_keys = catalog_remote_keys,
+    }
 end
 
 function GrimmorySync:convertAuthorName(author)
@@ -5170,7 +5192,7 @@ function GrimmorySync:findManifestIdentityMatch(remote, local_index, manifest, s
     return canonical.book, canonical, candidates
 end
 
-function GrimmorySync:buildMirrorCleanupQueue(local_books, remote_books, manifest)
+function GrimmorySync:buildMirrorCleanupQueue(local_books, remote_books, manifest, catalog_remote_keys)
     local queue = {}
     local stats = {
         skipped_open = 0,
@@ -5186,7 +5208,7 @@ function GrimmorySync:buildMirrorCleanupQueue(local_books, remote_books, manifes
 
     manifest = manifest or self:loadManifest()
     local scope = self:currentSyncScope()
-    local remote_keys = self:remoteBookKeySet(remote_books)
+    local remote_keys = catalog_remote_keys or self:remoteBookKeySet(remote_books)
     local local_index = self:buildLocalBookIndex(local_books)
     local duplicate_paths = {}
     local checked_remote_keys = {}
@@ -6787,7 +6809,7 @@ function GrimmorySync:performSync()
             #local_books
         ))
         
-        local remote_books, err = self:fetchBooklistFromServer()
+        local remote_books, err, catalog_stats = self:fetchBooklistFromServer()
         
         if not remote_books then
             return false, err
@@ -6825,14 +6847,20 @@ function GrimmorySync:performSync()
         ))
         
         local missing, manifest = self:buildMissingBookQueue(local_books, remote_books)
-        local cleanup_queue, cleanup_stats = self:buildMirrorCleanupQueue(local_books, remote_books, manifest)
+        local cleanup_queue, cleanup_stats = self:buildMirrorCleanupQueue(
+            local_books,
+            remote_books,
+            manifest,
+            catalog_stats and catalog_stats.remote_keys
+        )
         return true, {
             missing = missing,
             manifest = manifest,
             cleanup_queue = cleanup_queue,
             cleanup_stats = cleanup_stats,
             local_count = #local_books,
-            remote_count = #remote_books,
+            remote_count = catalog_stats and catalog_stats.entries_seen or #remote_books,
+            remote_epub_count = #remote_books,
             api_error = api_error,
         }
     end)

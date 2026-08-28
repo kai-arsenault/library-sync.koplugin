@@ -358,23 +358,66 @@ local unverified_books, unverified_err = plugin:fetchBooklistFromServer()
 assert(unverified_books == nil)
 assert(unverified_err:match("total result count"))
 
-local unusable_feed = [[
+local unsupported_format_feed = [[
 <feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
-  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:totalResults>2</opensearch:totalResults>
   <entry>
-    <title>Unavailable book</title>
+    <title>PDF book</title>
     <id>urn:bookorbit:book:99</id>
+    <author><name>PDF Author</name></author>
+    <link rel="http://opds-spec.org/acquisition" href="/api/v1/opds/99/download?fileId=199" type="application/pdf"/>
+  </entry>
+  <entry>
+    <title>CBZ book</title>
+    <id>urn:bookorbit:book:100</id>
+    <author><name>CBZ Author</name></author>
+    <link rel="http://opds-spec.org/acquisition" href="/api/v1/opds/100/download?fileId=200" type="application/vnd.comicbook+zip"/>
   </entry>
 </feed>
 ]]
 plugin.makeRequest = function(_, endpoint)
     if endpoint == "/api/v1/opds" then return root_feed, nil end
-    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return unusable_feed, nil end
+    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return unsupported_format_feed, nil end
     return nil, "unexpected endpoint"
 end
-local unusable_books, unusable_err = plugin:fetchBooklistFromServer()
-assert(unusable_books == nil)
-assert(unusable_err:match("1 OPDS catalog entries"))
+local unsupported_books, unsupported_err, unsupported_stats = plugin:fetchBooklistFromServer()
+assert(unsupported_books, tostring(unsupported_err))
+assert(#unsupported_books == 0)
+assert(unsupported_stats.entries_seen == 2)
+assert(unsupported_stats.unsupported_entries == 2)
+assert(unsupported_stats.remote_keys["id:99"] == true)
+assert(unsupported_stats.remote_keys["id:100"] == true)
+
+local unsupported_local_path = "/library/PDF book - PDF Author.epub"
+local unsupported_manifest = { books = {} }
+assert(plugin:trackManifestEntryScope(unsupported_manifest, unsupported_local_path, {
+    book_id = "99",
+    title = "PDF book",
+    author = "PDF Author",
+}) == true)
+fake_files[unsupported_local_path] = true
+local unsupported_cleanup = plugin:buildMirrorCleanupQueue(
+    { { path = unsupported_local_path, filename = "PDF book - PDF Author.epub" } },
+    unsupported_books,
+    unsupported_manifest,
+    unsupported_stats.remote_keys
+)
+assert(#unsupported_cleanup == 0)
+
+local unidentified_feed = [[
+<feed xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <entry><updated>2026-08-28T08:00:00Z</updated></entry>
+</feed>
+]]
+plugin.makeRequest = function(_, endpoint)
+    if endpoint == "/api/v1/opds" then return root_feed, nil end
+    if endpoint == "/api/v1/opds/catalog?page=1&size=50" then return unidentified_feed, nil end
+    return nil, "unexpected endpoint"
+end
+local unidentified_books, unidentified_err = plugin:fetchBooklistFromServer()
+assert(unidentified_books == nil)
+assert(unidentified_err:match("could not identify 1 OPDS catalog entries"))
 plugin.mirror_selected_sync_source = false
 
 plugin.makeRequest = function(_, endpoint)

@@ -152,7 +152,7 @@ It also moves older manifest-tracked duplicate files when multiple local paths p
 
 Library Sync matches manifest-tracked books by stable server ID before comparing filenames. Changing a BookOrbit title, subtitle, volume formatting, or source filename therefore does not make an existing tracked book appear missing. Metadata refresh replaces the existing local path and does not rename it automatically.
 
-Mirror cleanup only starts after every OPDS page has loaded successfully, the server's advertised catalogue total has been verified, and every catalogue entry has a usable book download. A failed, incomplete, or unverifiable catalogue aborts the sync before downloads or local moves. Large cleanup queues require a second confirmation showing the local count, received server count, and exact number of files to move.
+Mirror cleanup only starts after every OPDS page has loaded successfully and the server's advertised catalogue total has been verified. Non-EPUB entries such as PDF or CBZ books count as present on the server, so they protect matching tracked files from cleanup, but Library Sync does not download them. A failed, incomplete, or unverifiable catalogue aborts the sync before downloads or local moves. Large cleanup queues require a second confirmation showing the local count, received server count, and exact number of files to move.
 
 Each new cleanup run uses one timestamped trash batch. To recover books, use:
 
