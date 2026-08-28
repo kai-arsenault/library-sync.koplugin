@@ -99,6 +99,8 @@ local MIRROR_LARGE_CLEANUP_MIN_COUNT = 20
 local MIRROR_LARGE_CLEANUP_RATIO = 0.10
 local METADATA_LARGE_REFRESH_MIN_COUNT = 100
 local METADATA_LARGE_REFRESH_RATIO = 0.25
+local BOOKORBIT_MATCH_BATCH_SIZE = 100
+local BOOKORBIT_RECONCILE_HASH_BATCH_SIZE = 25
 local SIGNATURE_SEPARATOR = "\31"
 local ABORTED = "aborted"
 local SERVER_GRIMMORY = "grimmory"
@@ -1234,6 +1236,15 @@ function GrimmorySync:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("BookOrbit integration"),
+                enabled_func = function()
+                    return self.server_type == SERVER_BOOKORBIT
+                end,
+                sub_item_table_func = function()
+                    return self:getBookOrbitIntegrationMenu()
+                end,
+            },
+            {
                 text = _("Download folder profile"),
                 sub_item_table_func = function()
                     return self:getRoutingProfileMenu()
@@ -1393,6 +1404,23 @@ function GrimmorySync:getBookshelfIntegrationMenu()
                     })
                 end)
             end,
+        },
+    }
+end
+
+function GrimmorySync:getBookOrbitIntegrationMenu()
+    return {
+        {
+            text = _("Register existing Library Sync books"),
+            callback = function(touchmenu_instance)
+                self:runAfterMenuClose(touchmenu_instance, function()
+                    self:startBookOrbitReconcile()
+                end)
+            end,
+        },
+        {
+            text = _("Registers downloaded EPUB files in the BookOrbit plugin without opening them or changing reading status."),
+            enabled = false,
         },
     }
 end
@@ -2183,7 +2211,6 @@ function GrimmorySync:bookIdFromOpds(entry, download_link)
         "/opds/books/(%d+)",
         "[?&]bookId=(%d+)",
         "[?&]book_id=(%d+)",
-        "[?&]fileId=(%d+)",
         "[?&]id=(%d+)",
     }
 
@@ -2197,6 +2224,27 @@ function GrimmorySync:bookIdFromOpds(entry, download_link)
         end
     end
 
+    return nil
+end
+
+function GrimmorySync:bookFileIdFromOpds(entry, download_link)
+    local candidates = { download_link, entry }
+    local patterns = {
+        "[?&]fileId=(%d+)",
+        "[?&]file_id=(%d+)",
+        "<bookFileId>%s*(%d+)%s*</bookFileId>",
+        "<fileId>%s*(%d+)%s*</fileId>",
+    }
+
+    for _, value in ipairs(candidates) do
+        value = tostring(value or "")
+        for _, pattern in ipairs(patterns) do
+            local matched = value:match(pattern)
+            if matched and matched ~= "" then
+                return matched
+            end
+        end
+    end
     return nil
 end
 
@@ -2521,6 +2569,7 @@ function GrimmorySync:fetchBooklistFromServer()
             local identity_link = download_link
                 or (acquisition_links[1] and acquisition_links[1].href)
             local book_id = self:bookIdFromOpds(entry, identity_link)
+            local book_file_id = self:bookFileIdFromOpds(entry, identity_link)
             local catalog_key = self:remoteBookKey({
                 book_id = book_id,
                 download_url = identity_link,
@@ -2560,6 +2609,7 @@ function GrimmorySync:fetchBooklistFromServer()
                 logger.info("[GrimmorySync] Found book:", title, "by", author or "Unknown", "series:", series or "none", "->", download_link)
                 table.insert(books, {
                     book_id = book_id,
+                    book_file_id = book_file_id,
                     title = title,
                     author = author,
                     series = series,
@@ -3595,6 +3645,8 @@ function GrimmorySync:migrateManifestSignature(manifest_entry, remote)
     manifest_entry.hardcover_id = remote.hardcover_id
     manifest_entry.hardcover_book_id = remote.hardcover_book_id
     manifest_entry.hardcover_edition_id = remote.hardcover_edition_id
+    manifest_entry.bookorbit_book_id = self:bookOrbitBookId(remote)
+    manifest_entry.bookorbit_file_id = self:bookOrbitFileId(remote)
     manifest_entry.signature_migrated_at = os.time()
 end
 
@@ -3609,6 +3661,8 @@ function GrimmorySync:updateManifestRemoteState(manifest_entry, remote)
     manifest_entry.hardcover_id = remote.hardcover_id
     manifest_entry.hardcover_book_id = remote.hardcover_book_id
     manifest_entry.hardcover_edition_id = remote.hardcover_edition_id
+    manifest_entry.bookorbit_book_id = self:bookOrbitBookId(remote)
+    manifest_entry.bookorbit_file_id = self:bookOrbitFileId(remote)
 end
 
 function GrimmorySync:getManifestEntry(manifest, path)
@@ -3629,6 +3683,8 @@ function GrimmorySync:storeManifestEntry(manifest, path, remote)
         hardcover_id = remote.hardcover_id,
         hardcover_book_id = remote.hardcover_book_id,
         hardcover_edition_id = remote.hardcover_edition_id,
+        bookorbit_book_id = self:bookOrbitBookId(remote),
+        bookorbit_file_id = self:bookOrbitFileId(remote),
         server_type = scope_fields.server_type,
         server_url = scope_fields.server_url,
         sync_source = scope_fields.sync_source,
@@ -3637,6 +3693,227 @@ function GrimmorySync:storeManifestEntry(manifest, path, remote)
         remote_key = scope_fields.remote_key,
         refreshed_at = os.time(),
     }
+end
+
+function GrimmorySync:bookOrbitBookId(value)
+    if type(value) ~= "table" then return nil end
+    local id = value.bookorbit_book_id or value.book_id or value.bookId
+    if id == nil and type(value.remote_key) == "string" then
+        id = value.remote_key:match("^id:(%d+)$")
+    end
+    if id == nil or tostring(id) == "" then return nil end
+    return tostring(id)
+end
+
+function GrimmorySync:bookOrbitFileId(value)
+    if type(value) ~= "table" then return nil end
+    local id = value.bookorbit_file_id or value.book_file_id or value.bookFileId or value.fileId
+    if id == nil then
+        id = self:bookFileIdFromOpds(nil, value.download_url)
+    end
+    if id == nil or tostring(id) == "" then return nil end
+    return tostring(id)
+end
+
+function GrimmorySync:bookOrbitRuntime(require_client)
+    local ok_state, StateManager = pcall(require, "bookorbit_state_manager")
+    if not ok_state or not StateManager or type(StateManager.linkFiles) ~= "function" then
+        return nil, nil, _("BookOrbit plugin is unavailable or needs to be updated.")
+    end
+    if not require_client then
+        return StateManager, nil, nil
+    end
+
+    local ok_loader, PluginLoader = pcall(require, "pluginloader")
+    if not ok_loader or not PluginLoader or type(PluginLoader.getPluginInstance) ~= "function" then
+        return StateManager, nil, _("BookOrbit plugin is unavailable.")
+    end
+    local ok_plugin, plugin = pcall(PluginLoader.getPluginInstance, PluginLoader, "bookorbit")
+    if not ok_plugin or not plugin or type(plugin.newClient) ~= "function" then
+        return StateManager, nil, _("BookOrbit plugin is unavailable.")
+    end
+    if type(plugin.isLoggedIn) == "function" and not plugin:isLoggedIn() then
+        return StateManager, nil, _("BookOrbit plugin is not logged in.")
+    end
+    local ok_client, client = pcall(plugin.newClient, plugin)
+    if not ok_client or not client or type(client.matchCheck) ~= "function" then
+        return StateManager, nil, _("Could not create the BookOrbit client.")
+    end
+    return StateManager, client, nil
+end
+
+function GrimmorySync:queueBookOrbitRegistration(path, book)
+    if self.server_type ~= SERVER_BOOKORBIT or not self:isEpubPath(path) then
+        return false
+    end
+
+    local ok_util, util = pcall(require, "util")
+    if not ok_util or not util or type(util.partialMD5) ~= "function" then
+        logger.warn("[GrimmorySync] BookOrbit registration skipped; partialMD5 unavailable:", path)
+        return false
+    end
+    local ok_digest, digest = pcall(util.partialMD5, path)
+    if not ok_digest or type(digest) ~= "string" or digest == "" then
+        logger.warn("[GrimmorySync] BookOrbit registration hash failed:", path)
+        return false
+    end
+
+    local size, modification
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok_lfs and lfs then
+        local ok_attr, attr = pcall(lfs.attributes, path)
+        if ok_attr and attr then
+            size = attr.size
+            modification = attr.modification
+        end
+    end
+
+    self.bookorbit_link_queue = self.bookorbit_link_queue or {}
+    self.bookorbit_link_queue[path] = {
+        path = path,
+        digest = digest,
+        book = book or {},
+        size = size,
+        modification = modification,
+    }
+    return true
+end
+
+function GrimmorySync:updateManifestBookOrbitLink(manifest, item, match)
+    if type(manifest) ~= "table" or type(manifest.books) ~= "table" then return end
+    local entry = manifest.books[self:manifestKeyForPath(item.path)]
+    if type(entry) ~= "table" then return end
+    entry.bookorbit_book_id = tostring(match.bookId)
+    entry.bookorbit_file_id = tostring(match.bookFileId)
+    entry.bookorbit_digest = item.digest
+    entry.bookorbit_file_size = item.size
+    entry.bookorbit_file_mtime = item.modification
+    entry.bookorbit_linked_at = os.time()
+end
+
+function GrimmorySync:flushBookOrbitRegistrationQueue(manifest)
+    local queued = self.bookorbit_link_queue or {}
+    self.bookorbit_link_queue = {}
+    local items = {}
+    for _, item in pairs(queued) do items[#items + 1] = item end
+    table.sort(items, function(a, b) return tostring(a.path) < tostring(b.path) end)
+
+    local result = { queued = #items, linked = 0, unmatched = 0, failed = 0 }
+    if #items == 0 then return true, result end
+
+    local StateManager, _, runtime_err = self:bookOrbitRuntime(false)
+    if not StateManager then
+        self.bookorbit_link_queue = queued
+        result.failed = #items
+        result.error = runtime_err
+        return false, result
+    end
+
+    local direct, direct_items, fallback = {}, {}, {}
+    for _, item in ipairs(items) do
+        local book_id = self:bookOrbitBookId(item.book)
+        local file_id = self:bookOrbitFileId(item.book)
+        if book_id and file_id then
+            direct[#direct + 1] = {
+                digest = item.digest,
+                bookFileId = tonumber(file_id) or file_id,
+                bookId = tonumber(book_id) or book_id,
+                file = item.path,
+            }
+            direct_items[#direct_items + 1] = item
+        else
+            fallback[#fallback + 1] = item
+        end
+    end
+
+    if #direct > 0 then
+        local ok_link, link_err = pcall(StateManager.linkFiles, direct)
+        if not ok_link then
+            for _, item in ipairs(items) do self.bookorbit_link_queue[item.path] = item end
+            result.failed = #items
+            result.error = tostring(link_err)
+            return false, result
+        end
+        for index, link in ipairs(direct) do
+            self:updateManifestBookOrbitLink(manifest, direct_items[index], link)
+        end
+        result.linked = result.linked + #direct
+    end
+
+    if #fallback > 0 then
+        local _, client, client_err = self:bookOrbitRuntime(true)
+        if not client then
+            for _, item in ipairs(fallback) do self.bookorbit_link_queue[item.path] = item end
+            result.failed = result.failed + #fallback
+            result.error = client_err
+            return false, result
+        end
+
+        for first = 1, #fallback, BOOKORBIT_MATCH_BATCH_SIZE do
+            local last = math.min(first + BOOKORBIT_MATCH_BATCH_SIZE - 1, #fallback)
+            local hashes, candidates, batch_items = {}, {}, {}
+            for index = first, last do
+                local item = fallback[index]
+                hashes[#hashes + 1] = item.digest
+                candidates[item.digest] = {
+                    title = item.book.title,
+                    authors = item.book.author,
+                    source = "file",
+                }
+                batch_items[item.digest] = item
+            end
+            local body, match_err = client:matchCheck(hashes, candidates)
+            if not body then
+                for index = first, #fallback do
+                    local item = fallback[index]
+                    self.bookorbit_link_queue[item.path] = item
+                end
+                result.failed = result.failed + (#fallback - first + 1)
+                result.error = tostring(match_err)
+                return false, result
+            end
+            if body.libraryVersion and type(StateManager.applyLibraryVersion) == "function" then
+                pcall(StateManager.applyLibraryVersion, body.libraryVersion)
+            end
+
+            local links, matched = {}, {}
+            for _, match in ipairs(body.matches or {}) do
+                local item = batch_items[match.hash]
+                if item and match.bookId and match.bookFileId then
+                    links[#links + 1] = {
+                        digest = item.digest,
+                        bookFileId = match.bookFileId,
+                        bookId = match.bookId,
+                        file = item.path,
+                    }
+                    matched[item.digest] = true
+                end
+            end
+            if #links > 0 then
+                local ok_link, link_err = pcall(StateManager.linkFiles, links)
+                if not ok_link then
+                    for index = first, #fallback do
+                        local item = fallback[index]
+                        self.bookorbit_link_queue[item.path] = item
+                    end
+                    result.failed = result.failed + (last - first + 1)
+                    result.error = tostring(link_err)
+                    return false, result
+                end
+                for _, link in ipairs(links) do
+                    self:updateManifestBookOrbitLink(manifest, batch_items[link.digest], link)
+                end
+                result.linked = result.linked + #links
+            end
+            for index = first, last do
+                if not matched[fallback[index].digest] then
+                    result.unmatched = result.unmatched + 1
+                end
+            end
+        end
+    end
+
+    return true, result
 end
 
 function GrimmorySync:trackManifestEntryScope(manifest, path, remote)
@@ -5968,6 +6245,12 @@ function GrimmorySync:downloadMissingBooksAsync(missing, manifest, done_callback
     end
 
     local function finish(success, result)
+        local link_ok, link_result = self:flushBookOrbitRegistrationQueue(manifest)
+        result = result or {}
+        result.bookorbit_links = link_result
+        if not link_ok then
+            logger.warn("[GrimmorySync] BookOrbit auto-registration failed:", link_result and link_result.error)
+        end
         self:saveManifest(manifest)
         done_callback(success, result)
     end
@@ -6156,6 +6439,12 @@ function GrimmorySync:refreshExistingMetadataAsync(matched, skipped, manifest, d
     end
 
     local function finish(success, result)
+        local link_ok, link_result = self:flushBookOrbitRegistrationQueue(manifest)
+        result = result or {}
+        result.bookorbit_links = link_result
+        if not link_ok then
+            logger.warn("[GrimmorySync] BookOrbit auto-registration failed:", link_result and link_result.error)
+        end
         self:saveManifest(manifest)
         done_callback(success, result)
     end
@@ -6414,11 +6703,205 @@ function GrimmorySync:downloadBook(book, target_path, options)
         pcall(os.remove, backup_path)
     end
 
+    -- The final path now contains the verified bytes. Hash it while the sync
+    -- progress UI is already active, then batch the BookOrbit state write at
+    -- the end of the operation instead of rewriting its state per book.
+    self:queueBookOrbitRegistration(full_path, book)
+
     logger.info("[GrimmorySync] OK:", book.title, "(" .. attr.size .. " bytes)")
     if options.record_history ~= false then
         self:recordDownload(book, full_path)
     end
     return true, full_path
+end
+
+function GrimmorySync:bookOrbitManifestCandidates(manifest)
+    local candidates = {}
+    local current_server = self:serverBaseUrl()
+    for path, entry in pairs((manifest and manifest.books) or {}) do
+        if type(entry) == "table"
+                and entry.server_type == SERVER_BOOKORBIT
+                and self:isEpubPath(path)
+                and (entry.server_url == nil or entry.server_url == "" or entry.server_url == current_server) then
+            candidates[#candidates + 1] = { path = path, book = entry }
+        end
+    end
+    table.sort(candidates, function(a, b) return tostring(a.path) < tostring(b.path) end)
+    return candidates
+end
+
+function GrimmorySync:startBookOrbitReconcile()
+    if self.server_type ~= SERVER_BOOKORBIT then
+        UIManager:show(InfoMessage:new{
+            text = _("Configure Library Sync for BookOrbit first."),
+            timeout = 4,
+        })
+        return
+    end
+    if self.sync_running or self.auto_refresh_running then
+        UIManager:show(InfoMessage:new{
+            text = _("Library Sync is already running."),
+            timeout = 3,
+        })
+        return
+    end
+
+    local StateManager, _, runtime_err = self:bookOrbitRuntime(false)
+    if not StateManager then
+        UIManager:show(InfoMessage:new{ text = runtime_err, timeout = 5 })
+        return
+    end
+
+    local manifest = self:loadManifest()
+    local candidates = self:bookOrbitManifestCandidates(manifest)
+    if #candidates == 0 then
+        UIManager:show(InfoMessage:new{
+            text = _("No BookOrbit downloads were found in the Library Sync manifest."),
+            timeout = 4,
+        })
+        return
+    end
+
+    local confirm_dialog
+    confirm_dialog = ConfirmBox:new{
+        text = string.format(
+            _("Register %d existing Library Sync books in BookOrbit?\n\nFiles are matched by BookOrbit book/file IDs and partial file hashes. Books are not opened and reading status is not changed."),
+            #candidates
+        ),
+        ok_text = _("Register"),
+        cancel_text = _("Cancel"),
+        ok_callback = function()
+            pcall(function() UIManager:close(confirm_dialog) end)
+            UIManager:scheduleIn(0, function()
+                self:performBookOrbitReconcile(manifest, candidates, StateManager)
+            end)
+        end,
+    }
+    UIManager:show(confirm_dialog)
+end
+
+function GrimmorySync:performBookOrbitReconcile(manifest, candidates, StateManager)
+    local ok_util, util = pcall(require, "util")
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_util or not util or type(util.partialMD5) ~= "function" or not ok_lfs or not lfs then
+        UIManager:show(InfoMessage:new{
+            text = _("Could not load the file hashing support required by BookOrbit."),
+            timeout = 5,
+        })
+        return
+    end
+
+    self.sync_running = true
+    self.abort_sync = false
+    self.abort_notified = false
+    self.bookorbit_link_queue = {}
+
+    local maps = { byBookId = {}, byFileId = {} }
+    if type(StateManager.onDeviceMaps) == "function" then
+        local ok_maps, loaded_maps = pcall(StateManager.onDeviceMaps)
+        if ok_maps and type(loaded_maps) == "table" then maps = loaded_maps end
+    end
+
+    local result = {
+        total = #candidates,
+        scanned = 0,
+        already_linked = 0,
+        ready = 0,
+        missing = 0,
+        hash_failed = 0,
+    }
+    local index = 0
+
+    local function mapValue(values, id)
+        if id == nil or type(values) ~= "table" then return nil end
+        return values[tonumber(id) or id] or values[id]
+    end
+
+    local function mappedPath(book_id, file_id)
+        return mapValue(maps.byFileId, file_id) or mapValue(maps.byBookId, book_id)
+    end
+
+    local function finish(canceled)
+        local link_ok, link_result = self:flushBookOrbitRegistrationQueue(manifest)
+        self:saveManifest(manifest)
+        self:closeProgressDialog()
+        self.sync_running = false
+
+        link_result = link_result or { linked = 0, unmatched = 0, failed = 0 }
+        local message = string.format(
+            _("BookOrbit registration complete.\n\nRegistered: %d\nAlready registered: %d\nNot matched: %d\nMissing files: %d\nHash failures: %d"),
+            link_result.linked or 0,
+            result.already_linked,
+            link_result.unmatched or 0,
+            result.missing,
+            result.hash_failed
+        )
+        if canceled then message = _("BookOrbit registration stopped.") .. "\n\n" .. message end
+        if not link_ok and link_result.error then
+            message = message .. "\n\n" .. string.format(_("Latest error: %s"), tostring(link_result.error))
+        end
+        UIManager:show(InfoMessage:new{ text = message, timeout = 8 })
+    end
+
+    local function step()
+        if self.abort_sync then
+            finish(true)
+            return
+        end
+
+        local batch_end = math.min(index + BOOKORBIT_RECONCILE_HASH_BATCH_SIZE, #candidates)
+        while index < batch_end do
+            index = index + 1
+            local candidate = candidates[index]
+            local path, entry = candidate.path, candidate.book
+            local ok_attr, attr = pcall(lfs.attributes, path)
+            if not ok_attr or not attr or attr.mode ~= "file" then
+                result.missing = result.missing + 1
+            else
+                local book_id = self:bookOrbitBookId(entry)
+                local file_id = self:bookOrbitFileId(entry)
+                local linked_path = mappedPath(book_id, file_id)
+                local metadata_unchanged = entry.bookorbit_digest
+                    and entry.bookorbit_file_size == attr.size
+                    and (entry.bookorbit_file_mtime == nil or entry.bookorbit_file_mtime == attr.modification)
+                    and self:normalizePathForCompare(linked_path) == self:normalizePathForCompare(path)
+                if metadata_unchanged then
+                    result.already_linked = result.already_linked + 1
+                else
+                    local ok_digest, digest = pcall(util.partialMD5, path)
+                    if not ok_digest or type(digest) ~= "string" or digest == "" then
+                        result.hash_failed = result.hash_failed + 1
+                    else
+                        self.bookorbit_link_queue[path] = {
+                            path = path,
+                            digest = digest,
+                            book = entry,
+                            size = attr.size,
+                            modification = attr.modification,
+                        }
+                        result.ready = result.ready + 1
+                    end
+                end
+            end
+            result.scanned = result.scanned + 1
+        end
+
+        self:showProgressDialog(string.format(
+            _("Registering BookOrbit books %d of %d...\n\nReady to register: %d\nAlready registered: %d\n\nTap Cancel to stop."),
+            result.scanned,
+            result.total,
+            result.ready,
+            result.already_linked
+        ))
+
+        if index >= #candidates then
+            finish(false)
+        else
+            UIManager:scheduleIn(0, step)
+        end
+    end
+
+    UIManager:scheduleIn(0, step)
 end
 
 function GrimmorySync:requestAbort(message)

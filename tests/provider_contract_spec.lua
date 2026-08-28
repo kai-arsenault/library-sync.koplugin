@@ -18,6 +18,27 @@ local decoded_json = {}
 local fake_files = {}
 local fake_dirs = {}
 local fake_dir_entries = {}
+local bookorbit_links = {}
+package.preload["util"] = function()
+    return {
+        partialMD5 = function(path)
+            return "digest:" .. tostring(path)
+        end,
+    }
+end
+package.preload["bookorbit_state_manager"] = function()
+    return {
+        linkFiles = function(entries)
+            for _, entry in ipairs(entries or {}) do
+                bookorbit_links[#bookorbit_links + 1] = entry
+            end
+            return 1
+        end,
+        onDeviceMaps = function()
+            return { byBookId = {}, byFileId = {} }
+        end,
+    }
+end
 package.preload["json"] = function()
     return { decode = function(body) return decoded_json[body] end }
 end
@@ -261,6 +282,7 @@ local series, series_index = plugin:seriesFromOpdsEntry(entry)
 assert(series == "Apollo")
 assert(series_index == "2")
 assert(plugin:bookIdFromOpds(entry, "/api/v1/opds/42/download?fileId=9") == "42")
+assert(plugin:bookFileIdFromOpds(entry, "/api/v1/opds/42/download?fileId=9") == "9")
 assert(plugin:isLikelyBookDownloadLink({
     rel = "http://opds-spec.org/acquisition",
     href = "/api/v1/opds/42/download?fileId=10",
@@ -302,9 +324,34 @@ plugin.mirror_selected_sync_source = false
 local parsed_books = assert(plugin:fetchBooklistFromServer())
 assert(#parsed_books == 1)
 assert(parsed_books[1].book_id == "42")
+assert(parsed_books[1].book_file_id == "9")
 assert(parsed_books[1].series == "Apollo")
 assert(parsed_books[1].series_index == "2")
 assert(parsed_books[1].download_url == "/api/v1/opds/42/download?fileId=9")
+
+local linked_path = "/library/The Apollo Murders.epub"
+fake_files[linked_path] = true
+local linked_manifest = { books = {} }
+plugin:storeManifestEntry(linked_manifest, linked_path, parsed_books[1])
+assert(linked_manifest.books[linked_path].bookorbit_book_id == "42")
+assert(linked_manifest.books[linked_path].bookorbit_file_id == "9")
+assert(plugin:queueBookOrbitRegistration(linked_path, parsed_books[1]) == true)
+local registration_ok, registration = plugin:flushBookOrbitRegistrationQueue(linked_manifest)
+assert(registration_ok == true)
+assert(registration.linked == 1)
+assert(#bookorbit_links == 1)
+assert(bookorbit_links[1].bookId == 42)
+assert(bookorbit_links[1].bookFileId == 9)
+assert(bookorbit_links[1].file == linked_path)
+assert(bookorbit_links[1].digest == "digest:" .. linked_path)
+assert(linked_manifest.books[linked_path].bookorbit_digest == "digest:" .. linked_path)
+
+local legacy_bookorbit_entry = {
+    remote_key = "id:42",
+    download_url = "/api/v1/opds/42/download?fileId=9",
+}
+assert(plugin:bookOrbitBookId(legacy_bookorbit_entry) == "42")
+assert(plugin:bookOrbitFileId(legacy_bookorbit_entry) == "9")
 
 local paginated_first_page = catalog_feed:gsub(
     "</feed>",
