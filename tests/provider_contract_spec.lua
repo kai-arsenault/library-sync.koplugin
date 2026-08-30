@@ -308,6 +308,16 @@ assert(plugin:isLikelyBookDownloadLink({
     href = "/api/v1/opds/42/download?fileId=10",
     type = "application/pdf",
 }) == false)
+local cbz_link_ok, cbz_link_format = plugin:isLikelyBookDownloadLink({
+    rel = "http://opds-spec.org/acquisition",
+    href = "/api/v1/opds/100/download?fileId=200",
+    type = "application/vnd.comicbook+zip",
+})
+assert(cbz_link_ok == true)
+assert(cbz_link_format == "cbz")
+assert(plugin:isSyncBookPath("/library/Manga.cbz") == true)
+assert(plugin:isSyncBookPath("/library/Book.epub") == true)
+assert(plugin:isSyncBookPath("/library/Document.pdf") == false)
 
 local root_feed = [[
 <feed>
@@ -365,6 +375,28 @@ assert(bookorbit_links[1].bookFileId == 9)
 assert(bookorbit_links[1].file == linked_path)
 assert(bookorbit_links[1].digest == "digest:" .. linked_path)
 assert(linked_manifest.books[linked_path].bookorbit_digest == "digest:" .. linked_path)
+
+bookorbit_links = {}
+bookorbit_link_batch_sizes = {}
+local linked_cbz_path = "/library/Manga/The Apollo Murders.cbz"
+local linked_cbz = {
+    book_id = "43",
+    book_file_id = "10",
+    title = "The Apollo Murders",
+    author = "Chris Hadfield",
+    file_extension = "cbz",
+}
+fake_files[linked_cbz_path] = true
+local linked_cbz_manifest = { books = {} }
+plugin:storeManifestEntry(linked_cbz_manifest, linked_cbz_path, linked_cbz)
+assert(plugin:queueBookOrbitRegistration(linked_cbz_path, linked_cbz) == true)
+local cbz_registration_ok, cbz_registration = plugin:flushBookOrbitRegistrationQueue(linked_cbz_manifest)
+assert(cbz_registration_ok == true)
+assert(cbz_registration.linked == 1)
+assert(#bookorbit_links == 1)
+assert(bookorbit_links[1].file == linked_cbz_path)
+assert(bookorbit_links[1].bookId == 43)
+assert(bookorbit_links[1].bookFileId == 10)
 
 bookorbit_links = {}
 bookorbit_link_batch_sizes = {}
@@ -477,9 +509,13 @@ plugin.makeRequest = function(_, endpoint)
 end
 local unsupported_books, unsupported_err, unsupported_stats = plugin:fetchBooklistFromServer()
 assert(unsupported_books, tostring(unsupported_err))
-assert(#unsupported_books == 0)
+assert(#unsupported_books == 1)
+assert(unsupported_books[1].book_id == "100")
+assert(unsupported_books[1].file_extension == "cbz")
+assert(unsupported_books[1].download_url == "/api/v1/opds/100/download?fileId=200")
+assert(plugin:preferredDownloadFilename(unsupported_books[1]) == "CBZ book - CBZ Author.cbz")
 assert(unsupported_stats.entries_seen == 2)
-assert(unsupported_stats.unsupported_entries == 2)
+assert(unsupported_stats.unsupported_entries == 1)
 assert(unsupported_stats.remote_keys["id:99"] == true)
 assert(unsupported_stats.remote_keys["id:100"] == true)
 
@@ -811,6 +847,52 @@ assert(plugin:isLargeMirrorCleanup(large_cleanup, 3000) == true)
 assert(plugin:isLargeMirrorCleanup({ {}, {}, {}, {}, {} }, 10) == true)
 assert(plugin:isLargeMirrorCleanup({ {}, {}, {}, {} }, 100) == false)
 
+local removed_cbz_path = "/library/Manga/Removed series.cbz"
+local removed_cbz = {
+    book_id = "removed-cbz",
+    title = "Removed series",
+    author = "Manga Author",
+    file_extension = "cbz",
+    genres = {},
+}
+plugin:storeManifestEntry(identity_manifest, removed_cbz_path, removed_cbz)
+fake_files[removed_cbz_path] = true
+local existing_cbz = assert(plugin:buildMissingBookQueue({
+    { path = removed_cbz_path, filename = "Manga/Removed series.cbz" },
+}, { removed_cbz }))
+assert(#existing_cbz == 0)
+
+local old_epub_path = "/library/Manga/Changed format.epub"
+local old_epub = {
+    book_id = "changed-format",
+    title = "Changed format",
+    author = "Manga Author",
+    file_extension = "epub",
+    genres = {},
+}
+local changed_to_cbz = {
+    book_id = "changed-format",
+    title = "Changed format",
+    author = "Manga Author",
+    file_extension = "cbz",
+    source_relative_path = "Manga/Changed format.epub",
+    genres = {},
+}
+plugin:storeManifestEntry(identity_manifest, old_epub_path, old_epub)
+fake_files[old_epub_path] = true
+local changed_format_missing = assert(plugin:buildMissingBookQueue({
+    { path = old_epub_path, filename = "Manga/Changed format.epub" },
+}, { changed_to_cbz }))
+assert(#changed_format_missing == 1)
+assert(changed_format_missing[1] == changed_to_cbz)
+
+local cbz_cleanup = plugin:buildMirrorCleanupQueue({
+    { path = removed_cbz_path, filename = "Manga/Removed series.cbz" },
+}, {}, identity_manifest)
+assert(#cbz_cleanup == 1)
+assert(cbz_cleanup[1].path == removed_cbz_path)
+assert(cbz_cleanup[1].reason == "removed")
+
 local trash_root = "/library/.library-sync-trash"
 local new_batch = trash_root .. "/20260828-100000"
 local old_batch = trash_root .. "/20260828-090000"
@@ -824,20 +906,23 @@ fake_dir_entries[trash_root] = { ".", "..", "20260828-090000", "20260828-100000"
 fake_dir_entries[new_batch] = { ".", "..", ".library-sync-restore.lua", "Fiction", "Manga" }
 fake_dir_entries[old_batch] = { ".", "..", "Fiction" }
 fake_dir_entries[new_batch .. "/Fiction"] = { ".", "..", "Min kamp 6.epub" }
-fake_dir_entries[new_batch .. "/Manga"] = { ".", "..", "Existing.epub" }
+fake_dir_entries[new_batch .. "/Manga"] = { ".", "..", "Existing.epub", "Restore.cbz" }
 fake_dir_entries[old_batch .. "/Fiction"] = { ".", "..", "Min kamp 6.epub" }
 fake_files[new_batch .. "/Fiction/Min kamp 6.epub"] = true
 fake_files[new_batch .. "/Manga/Existing.epub"] = true
+fake_files[new_batch .. "/Manga/Restore.cbz"] = true
 fake_files[old_batch .. "/Fiction/Min kamp 6.epub"] = true
 fake_files["/library/Manga/Existing.epub"] = true
 
 local restore_queue, restore_stats, restore_err = plugin:buildMirrorRestoreQueue()
 assert(restore_queue, tostring(restore_err))
-assert(#restore_queue == 1)
+assert(#restore_queue == 2)
 assert(restore_queue[1].source == new_batch .. "/Fiction/Min kamp 6.epub")
 assert(restore_queue[1].destination == "/library/Fiction/Min kamp 6.epub")
+assert(restore_queue[2].source == new_batch .. "/Manga/Restore.cbz")
+assert(restore_queue[2].destination == "/library/Manga/Restore.cbz")
 assert(restore_stats.batches == 2)
-assert(restore_stats.found == 3)
+assert(restore_stats.found == 4)
 assert(restore_stats.conflicts == 1)
 assert(restore_stats.older_backups == 1)
 

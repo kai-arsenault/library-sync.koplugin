@@ -102,6 +102,8 @@ local METADATA_LARGE_REFRESH_RATIO = 0.25
 local BOOKORBIT_LINK_BATCH_SIZE = 100
 local BOOKORBIT_MATCH_BATCH_SIZE = 100
 local BOOKORBIT_RECONCILE_HASH_BATCH_SIZE = 25
+local SYNC_BOOK_EXTENSIONS = { epub = true, cbz = true }
+local LOCAL_BOOK_EXTENSIONS = { epub = true, cbz = true, pdf = true, mobi = true, azw3 = true }
 local SIGNATURE_SEPARATOR = "\31"
 local ABORTED = "aborted"
 local SERVER_GRIMMORY = "grimmory"
@@ -1173,7 +1175,7 @@ function GrimmorySync:registerFileDialogButtons()
     end
 
     FileManager:addFileDialogButtons("grimmory_refresh_metadata", function(file, is_file)
-        if not is_file or not self:isEpubPath(file) then
+        if not is_file or not self:isSyncBookPath(file) then
             return nil
         end
 
@@ -1334,7 +1336,7 @@ function GrimmorySync:toggleMirrorSelectedSyncSource()
     local confirm_dialog
     confirm_dialog = ConfirmBox:new{
         text = string.format(
-            _("Mirror selected sync source?\n\nSource: %s\n\nWhen enabled, Sync missing books will also move manifest-tracked local EPUBs that are no longer in this source, plus older tracked duplicates of the same server book, to %s. Other local files are left untouched, and the currently open book is skipped."),
+            _("Mirror selected sync source?\n\nSource: %s\n\nWhen enabled, Sync missing books will also move manifest-tracked local EPUB and CBZ files that are no longer in this source, plus older tracked duplicates of the same server book, to %s. Other local files are left untouched, and the currently open book is skipped."),
             sync_source,
             MIRROR_TRASH_DIR
         ),
@@ -1422,7 +1424,7 @@ function GrimmorySync:getBookOrbitIntegrationMenu()
             end,
         },
         {
-            text = _("Registers downloaded EPUB files in the BookOrbit plugin without opening them or changing reading status."),
+            text = _("Registers downloaded EPUB and CBZ files in the BookOrbit plugin without opening them or changing reading status."),
             enabled = false,
         },
     }
@@ -1904,9 +1906,8 @@ function GrimmorySync:scanLocalBooks()
                             scanDirectory(full_path, rel_path)
                         end
                     elseif attr.mode == "file" then
-                        local ext = full_path:match("%.([^%.]+)$")
-                        if ext and (ext:lower() == "epub" or ext:lower() == "pdf" or 
-                                   ext:lower() == "mobi" or ext:lower() == "azw3") then
+                        local ext = (full_path:match("%.([^%.]+)$") or ""):lower()
+                        if LOCAL_BOOK_EXTENSIONS[ext] then
                             -- Store the relative path from local_path, including subdirs and extension
                             table.insert(books, {
                                 path = full_path,
@@ -2137,6 +2138,28 @@ function GrimmorySync:isOpdsAcquisitionLink(link)
     return rel:match("acquisition") ~= nil
 end
 
+function GrimmorySync:publicationExtensionFromLink(link)
+    if type(link) ~= "table" then return nil end
+    local type_lower = tostring(link.type or ""):lower()
+    if type_lower:match("epub") then
+        return "epub"
+    end
+    if type_lower:match("comicbook%+zip")
+        or type_lower:match("x%-cbz")
+        or type_lower:match("application/cbz") then
+        return "cbz"
+    end
+
+    for _, value in ipairs({ link.title, link.href }) do
+        local path = tostring(value or ""):gsub("[?#].*$", "")
+        local extension = self:bookExtensionForPath(path)
+        if extension and SYNC_BOOK_EXTENSIONS[extension] then
+            return extension
+        end
+    end
+    return nil
+end
+
 function GrimmorySync:isLikelyBookDownloadLink(link)
     if not self:isOpdsAcquisitionLink(link) then
         return false, "not acquisition"
@@ -2150,8 +2173,9 @@ function GrimmorySync:isLikelyBookDownloadLink(link)
         return false, type_lower ~= "" and type_lower or "navigation/media"
     end
 
-    if type_lower:match("epub") or href_lower:match("%.epub") then
-        return true, "epub"
+    local publication_extension = self:publicationExtensionFromLink(link)
+    if publication_extension then
+        return true, publication_extension
     end
 
     if type_lower ~= "" and not type_lower:match("octet%-stream") then
@@ -2170,6 +2194,7 @@ function GrimmorySync:isLikelyBookDownloadLink(link)
 end
 
 function GrimmorySync:opdsAcquisitionLink(entry, title)
+    local cbz
     local fallback
     local fallback_reason
 
@@ -2177,13 +2202,18 @@ function GrimmorySync:opdsAcquisitionLink(entry, title)
         local ok_link, reason = self:isLikelyBookDownloadLink(link)
         if ok_link then
             if reason == "epub" then
+                link.publication_extension = "epub"
                 return link
+            elseif reason == "cbz" then
+                link.publication_extension = "cbz"
+                cbz = cbz or link
+            else
+                fallback = fallback or link
+                fallback_reason = fallback_reason or reason
             end
-            fallback = fallback or link
-            fallback_reason = fallback_reason or reason
         elseif self:isOpdsAcquisitionLink(link) then
             logger.info(
-                "[GrimmorySync] Ignoring non-EPUB acquisition link:",
+                "[GrimmorySync] Ignoring unsupported acquisition link:",
                 title or "(untitled)",
                 "type:",
                 link.type or "",
@@ -2195,9 +2225,14 @@ function GrimmorySync:opdsAcquisitionLink(entry, title)
         end
     end
 
+    if cbz then
+        return cbz
+    end
+
     if fallback then
+        fallback.publication_extension = self:publicationExtensionFromLink(fallback) or "epub"
         logger.warn(
-            "[GrimmorySync] Using acquisition link without EPUB MIME type:",
+            "[GrimmorySync] Using acquisition link without a supported publication MIME type:",
             title or "(untitled)",
             "type:",
             fallback.type or "",
@@ -2273,14 +2308,14 @@ function GrimmorySync:fileNameFromOpdsLink(link)
     end
 
     local title = trim(tostring(link.title or ""))
-    if title:lower():match("%.epub$") then
+    if self:isSyncBookPath(title) then
         return title
     end
 
     local href = tostring(link.href or "")
     local path = href:gsub("[?#].*$", "")
-    local filename = path:match("([^/]+%.epub)$")
-    if filename then
+    local filename = path:match("([^/]+)$")
+    if filename and self:isSyncBookPath(filename) then
         return urlDecode(filename)
     end
 
@@ -2622,6 +2657,9 @@ function GrimmorySync:fetchBooklistFromServer()
             
             if title and download_link then
                 local opds_file_name = self:fileNameFromOpdsLink(acquisition_link)
+                local file_extension = acquisition_link.publication_extension
+                    or self:publicationExtensionFromLink(acquisition_link)
+                    or "epub"
                 if not book_id then
                     logger.warn("[GrimmorySync] Book ID missing from OPDS entry:", title, "download:", download_link)
                 end
@@ -2639,6 +2677,7 @@ function GrimmorySync:fetchBooklistFromServer()
                     description = description,
                     genres = genres,
                     opds_file_name = opds_file_name,
+                    file_extension = file_extension,
                     download_url = download_link,
                 })
             elseif title then
@@ -3128,10 +3167,44 @@ function GrimmorySync:sanitizeFilenamePart(value)
     return value ~= "" and value or nil
 end
 
-function GrimmorySync:withEpubExtension(filename)
+function GrimmorySync:bookFileExtension(book)
+    book = type(book) == "table" and book or {}
+    local explicit = trim(tostring(book.file_extension or "")):lower():gsub("^%.", "")
+    if SYNC_BOOK_EXTENSIONS[explicit] then
+        return explicit
+    end
+
+    for _, value in ipairs({
+        book.grimmory_file_name,
+        book.opds_file_name,
+        book.source_file_name,
+        book.file_name,
+        book.download_url,
+    }) do
+        local extension = self:bookExtensionForPath(tostring(value or ""):gsub("[?#].*$", ""))
+        if extension and SYNC_BOOK_EXTENSIONS[extension] then
+            return extension
+        end
+    end
+    return "epub"
+end
+
+function GrimmorySync:withBookExtension(filename, extension)
     if not filename or filename == "" then return nil end
-    if filename:match("%.[^%.]+$") then return filename end
-    return filename .. ".epub"
+    extension = tostring(extension or "epub"):lower():gsub("^%.", "")
+    if not SYNC_BOOK_EXTENSIONS[extension] then
+        extension = "epub"
+    end
+
+    local current = self:bookExtensionForPath(filename)
+    if current and (SYNC_BOOK_EXTENSIONS[current] or LOCAL_BOOK_EXTENSIONS[current]) then
+        filename = filename:sub(1, #filename - #current - 1)
+    end
+    return filename .. "." .. extension
+end
+
+function GrimmorySync:withEpubExtension(filename)
+    return self:withBookExtension(filename, "epub")
 end
 
 function GrimmorySync:grimmorySourceFilename(book)
@@ -3156,10 +3229,11 @@ function GrimmorySync:syncDefaultFilename(book)
     if not safe_title then return nil end
 
     local safe_author = self:sanitizeFilenamePart(self:convertAuthorName(book.author))
+    local extension = self:bookFileExtension(book)
     if safe_author then
-        return string.format("%s - %s.epub", safe_author, safe_title)
+        return string.format("%s - %s.%s", safe_author, safe_title, extension)
     end
-    return safe_title .. ".epub"
+    return safe_title .. "." .. extension
 end
 
 function GrimmorySync:calibreTitleAuthorsFilename(book)
@@ -3173,10 +3247,11 @@ function GrimmorySync:calibreTitleAuthorsFilenameForTitle(book, title)
     if not safe_title then return nil end
 
     local safe_author = self:sanitizeFilenamePart(book.author)
+    local extension = self:bookFileExtension(book)
     if safe_author then
-        return string.format("%s - %s.epub", safe_title, safe_author)
+        return string.format("%s - %s.%s", safe_title, safe_author, extension)
     end
-    return safe_title .. ".epub"
+    return safe_title .. "." .. extension
 end
 
 function GrimmorySync:articleSortedTitle(title)
@@ -3223,7 +3298,7 @@ function GrimmorySync:preferredDownloadFilename(book)
     end
 
     filename = filename or self:syncDefaultFilename(book) or self:calibreTitleAuthorsFilename(book)
-    return self:withEpubExtension(filename or "Untitled.epub")
+    return self:withBookExtension(filename or "Untitled", self:bookFileExtension(book))
 end
 
 function GrimmorySync:generatePossibleFilenames(book)
@@ -3233,7 +3308,7 @@ function GrimmorySync:generatePossibleFilenames(book)
     local function add(filename, sanitize)
         if not filename or filename == "" then return end
         filename = sanitize and self:sanitizeFilename(filename) or self:fileNameBase(filename)
-        filename = self:withEpubExtension(filename)
+        filename = self:withBookExtension(filename, self:bookFileExtension(book))
         if filename and not seen[filename] then
             seen[filename] = true
             filenames[#filenames + 1] = filename
@@ -3248,9 +3323,9 @@ function GrimmorySync:generatePossibleFilenames(book)
     add(self:calibreArticleSortedTitleAuthorsFilename(book), false)
 
     local safe_title = self:sanitizeFilenamePart(book and book.title)
-    add(safe_title and (safe_title .. ".epub"), false)
+    add(safe_title, false)
     if safe_title and not self:sanitizeFilenamePart(book and book.author) then
-        add(" - " .. safe_title .. ".epub", false)
+        add(" - " .. safe_title, false)
     end
 
     return filenames
@@ -3365,7 +3440,7 @@ function GrimmorySync:buildLocalBookIndex(local_books)
     }
 
     for _, book in ipairs(local_books) do
-        -- Extract just the filename from the path (could be nested like "Author - Series/1 - Title.epub")
+        -- Extract just the filename from the path (it may include routed subdirectories).
         local filename = book.filename:match("([^/]+)$") or book.filename
         local normalized = self:normalizeForComparison(filename)
         local normalized_path = self:normalizeForComparison((book.filename or ""):gsub("\\", "/"))
@@ -3392,6 +3467,12 @@ end
 function GrimmorySync:findLocalMatch(remote, local_index)
     local possible_names = self:generatePossibleFilenames(remote)
     local possible_paths = self:generatePossibleRelativePaths(remote)
+    local remote_extension = self:bookFileExtension(remote)
+
+    local function hasMatchingFormat(local_book)
+        if not local_book then return false end
+        return self:bookExtensionForPath(local_book.path or local_book.filename) == remote_extension
+    end
 
     logger.info("[GrimmorySync] Checking remote book:", remote.title, "author:", remote.author or "none", "series:", remote.series or "none")
     for idx, ppath in ipairs(possible_paths) do
@@ -3404,7 +3485,7 @@ function GrimmorySync:findLocalMatch(remote, local_index)
     for _, path in ipairs(possible_paths) do
         for _, normalized_path in ipairs(self:comparisonKeyVariants(path)) do
             local exact_path_match = local_index.path_lookup[normalized_path]
-            if exact_path_match then
+            if hasMatchingFormat(exact_path_match) then
                 return exact_path_match, path, false
             end
         end
@@ -3414,7 +3495,7 @@ function GrimmorySync:findLocalMatch(remote, local_index)
         local normalized = self:normalizeForComparison(name)
         for _, normalized_name in ipairs(self:comparisonKeyVariants(name)) do
             local exact_match = local_index.lookup[normalized_name]
-            if exact_match then
+            if hasMatchingFormat(exact_match) then
                 return exact_match, name, false
             end
         end
@@ -3423,7 +3504,8 @@ function GrimmorySync:findLocalMatch(remote, local_index)
         if normalized:match("^ %-") then
             local pattern = normalized:gsub("^ %- ", ".* %- ")
             for _, local_file in ipairs(local_index.files) do
-                if local_file.normalized:match(pattern .. "$") then
+                if hasMatchingFormat(local_file.book)
+                    and local_file.normalized:match(pattern .. "$") then
                     return local_file.book, local_file.normalized, true
                 end
             end
@@ -3704,6 +3786,7 @@ function GrimmorySync:storeManifestEntry(manifest, path, remote)
         hardcover_edition_id = remote.hardcover_edition_id,
         bookorbit_book_id = self:bookOrbitBookId(remote),
         bookorbit_file_id = self:bookOrbitFileId(remote),
+        file_extension = self:bookFileExtension(remote),
         server_type = scope_fields.server_type,
         server_url = scope_fields.server_url,
         sync_source = scope_fields.sync_source,
@@ -3762,7 +3845,7 @@ function GrimmorySync:bookOrbitRuntime(require_client)
 end
 
 function GrimmorySync:queueBookOrbitRegistration(path, book)
-    if self.server_type ~= SERVER_BOOKORBIT or not self:isEpubPath(path) then
+    if self.server_type ~= SERVER_BOOKORBIT or not self:isSyncBookPath(path) then
         return false
     end
 
@@ -3971,6 +4054,7 @@ function GrimmorySync:trackManifestEntryScope(manifest, path, remote)
     setField("sync_source_label", scope_fields.sync_source_label)
     setField("sync_scope_key", scope_fields.sync_scope_key)
     setField("remote_key", scope_fields.remote_key)
+    setField("file_extension", remote and self:bookFileExtension(remote) or entry.file_extension)
     setField("title", remote and remote.title or entry.title)
     setField("author", remote and remote.author or entry.author)
 
@@ -3994,6 +4078,18 @@ function GrimmorySync:isEpubPath(path)
     return (path:match("%.([^%.]+)$") or ""):lower() == "epub"
 end
 
+function GrimmorySync:bookExtensionForPath(path)
+    if type(path) ~= "string" then return nil end
+    local extension = path:match("%.([^%./\\]+)$")
+    if not extension then return nil end
+    return extension:lower()
+end
+
+function GrimmorySync:isSyncBookPath(path)
+    local extension = self:bookExtensionForPath(path)
+    return extension ~= nil and SYNC_BOOK_EXTENSIONS[extension] == true
+end
+
 function GrimmorySync:displayNameForPath(path)
     if type(path) ~= "string" or path == "" then
         return _("Unknown book")
@@ -4014,8 +4110,8 @@ function GrimmorySync:localBookFromPath(path)
     if type(path) ~= "string" or path == "" then
         return nil, _("No book file selected.")
     end
-    if not self:isEpubPath(path) then
-        return nil, _("Only EPUB files can be refreshed from the library server.")
+    if not self:isSyncBookPath(path) then
+        return nil, _("Only EPUB and CBZ files can be refreshed from the library server.")
     end
 
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
@@ -4631,7 +4727,7 @@ function GrimmorySync:metadataRefreshApiGuard(enriched, enrich_result, remote_co
     local matched = tonumber(enrich_result) or 0
     if minimum_ratio and remote_count > 0 and (matched / remote_count) < minimum_ratio then
         return string.format(
-            _("Metadata refresh stopped before replacing local files because %s matched only %d of %d OPDS EPUBs to API metadata."),
+            _("Metadata refresh stopped before replacing local files because %s matched only %d of %d supported OPDS books to API metadata."),
             self:serverName(),
             matched,
             remote_count
@@ -5529,10 +5625,12 @@ function GrimmorySync:manifestIdentityCandidates(remote, local_index, manifest, 
     end
 
     scope = scope or self:currentSyncScope()
+    local remote_extension = self:bookFileExtension(remote)
     for key, entry in pairs((manifest and manifest.books) or {}) do
         if type(entry) == "table"
             and entry.remote_key == remote_key
-            and self:manifestEntryMatchesScope(entry, scope) then
+            and self:manifestEntryMatchesScope(entry, scope)
+            and self:bookExtensionForPath(key) == remote_extension then
             local normalized_path = self:normalizePathForCompare(key)
             local book = local_index.absolute_path_lookup[normalized_path]
             if book then
@@ -5636,7 +5734,7 @@ function GrimmorySync:buildMirrorCleanupQueue(local_books, remote_books, manifes
             local path = key
             local normalized_path = self:normalizePathForCompare(path)
             if duplicate_paths[key] then
-                if not self:isPathInsideLocalLibrary(path) or self:isMirrorTrashPath(path) or not self:isEpubPath(path) then
+                if not self:isPathInsideLocalLibrary(path) or self:isMirrorTrashPath(path) or not self:isSyncBookPath(path) then
                     stats.skipped_outside = stats.skipped_outside + 1
                 elseif self:isCurrentDocumentPath(path) then
                     stats.skipped_open = stats.skipped_open + 1
@@ -5658,7 +5756,7 @@ function GrimmorySync:buildMirrorCleanupQueue(local_books, remote_books, manifes
                 end
             elseif remote_keys[remote_key] then
                 -- Still present in the selected sync source.
-            elseif not self:isPathInsideLocalLibrary(path) or self:isMirrorTrashPath(path) or not self:isEpubPath(path) then
+            elseif not self:isPathInsideLocalLibrary(path) or self:isMirrorTrashPath(path) or not self:isSyncBookPath(path) then
                 stats.skipped_outside = stats.skipped_outside + 1
             elseif self:isCurrentDocumentPath(path) then
                 stats.skipped_open = stats.skipped_open + 1
@@ -5931,7 +6029,7 @@ function GrimmorySync:buildMirrorRestoreQueue()
                 local attr = lfs.attributes(source)
                 if attr and attr.mode == "directory" then
                     scanBatch(batch, source, relative, restore_metadata)
-                elseif attr and attr.mode == "file" and self:isEpubPath(source) then
+                elseif attr and attr.mode == "file" and self:isSyncBookPath(source) then
                     stats.found = stats.found + 1
                     local destination = (self.local_path or DEFAULT_LOCAL_PATH):gsub("/+$", "") .. "/" .. relative
                     local normalized_destination = self:normalizePathForCompare(destination)
@@ -6542,7 +6640,8 @@ end
 function GrimmorySync:buildCalibrePath(book)
     -- Simply use generatePossibleFilenames to get the single unified format
     local possible = self:generatePossibleFilenames(book)
-    local filename = possible[1] or (book.title .. ".epub")
+    local filename = possible[1]
+        or (book.title .. "." .. self:bookFileExtension(book))
     local full_path = self.local_path .. "/" .. filename
     
     return full_path, self.local_path, filename
@@ -6622,6 +6721,20 @@ function GrimmorySync:downloadBook(book, target_path, options)
 
     logger.info("[GrimmorySync] Target path:", display_path)
 
+    local expected_extension = self:bookFileExtension(book)
+    local target_extension = self:bookExtensionForPath(full_path)
+    if target_extension ~= expected_extension then
+        logger.err(
+            "[GrimmorySync] Refusing publication format mismatch:",
+            full_path,
+            "expected:",
+            expected_extension,
+            "got:",
+            target_extension or "none"
+        )
+        return false
+    end
+
     -- Create directories
     if not ensureDir(dir_path) then
         return false
@@ -6643,7 +6756,7 @@ function GrimmorySync:downloadBook(book, target_path, options)
     pcall(os.remove, tmp_path)
     pcall(os.remove, backup_path)
 
-    -- Open a temporary file first so failed downloads do not corrupt the existing EPUB.
+    -- Open a temporary file first so failed downloads do not corrupt the existing book.
     local file = io.open(tmp_path, "wb")
     if not file then
         logger.err("[GrimmorySync] Cannot create:", tmp_path)
@@ -6748,7 +6861,7 @@ function GrimmorySync:bookOrbitManifestCandidates(manifest)
     for path, entry in pairs((manifest and manifest.books) or {}) do
         if type(entry) == "table"
                 and entry.server_type == SERVER_BOOKORBIT
-                and self:isEpubPath(path)
+                and self:isSyncBookPath(path)
                 and (entry.server_url == nil or entry.server_url == "" or entry.server_url == current_server) then
             candidates[#candidates + 1] = { path = path, book = entry }
         end
@@ -7191,7 +7304,7 @@ function GrimmorySync:startSync()
     -- Show confirmation with cancel option
     local confirm_text = _("Sync missing books?\n\nOnly books missing from this device will be downloaded. You can cancel at any time.")
     if self.mirror_selected_sync_source == true then
-        confirm_text = _("Sync and mirror selected source?\n\nMissing books will be downloaded. Manifest-tracked local EPUBs that are no longer in the selected sync source, plus older tracked duplicates of the same server book, will be moved to the local mirror trash. Other local files are left untouched. You can cancel at any time.")
+        confirm_text = _("Sync and mirror selected source?\n\nMissing books will be downloaded. Manifest-tracked local EPUB and CBZ files that are no longer in the selected sync source, plus older tracked duplicates of the same server book, will be moved to the local mirror trash. Other local files are left untouched. You can cancel at any time.")
     end
     local confirm_dialog
     confirm_dialog = ConfirmBox:new{
@@ -7280,7 +7393,7 @@ function GrimmorySync:startMetadataRefreshForFile(file_path, options)
         local close_dialog
         close_dialog = ConfirmBox:new{
             text = string.format(
-                _("Refresh metadata for the open book?\n\n%s\n\nKOReader must close the book before Library Sync can replace the EPUB safely."),
+                _("Refresh metadata for the open book?\n\n%s\n\nKOReader must close the book before Library Sync can replace the file safely."),
                 self:displayNameForPath(file_path)
             ),
             ok_text = _("Close and refresh"),
@@ -7297,7 +7410,7 @@ function GrimmorySync:startMetadataRefreshForFile(file_path, options)
     local confirm_dialog
     confirm_dialog = ConfirmBox:new{
         text = string.format(
-            _("Refresh metadata for this book?\n\n%s\n\nOnly this local EPUB will be matched and replaced if server metadata has changed."),
+            _("Refresh metadata for this book?\n\n%s\n\nOnly this local EPUB or CBZ file will be matched and replaced if server metadata has changed."),
             self:displayNameForPath(file_path)
         ),
         ok_text = _("Refresh"),
@@ -7323,7 +7436,7 @@ function GrimmorySync:startMetadataRefresh()
 
     local confirm_dialog
     confirm_dialog = ConfirmBox:new{
-        text = _("Refresh metadata in existing books?\n\nThe plugin will download matched EPUB files again from the configured server and replace local files only after the download has been verified. Missing books are not downloaded here. The currently open book is skipped."),
+        text = _("Refresh metadata in existing books?\n\nThe plugin will download matched EPUB and CBZ files again from the configured server and replace local files only after the download has been verified. Missing books are not downloaded here. The currently open book is skipped."),
         ok_text = _("Refresh"),
         cancel_text = _("Cancel"),
         ok_callback = function()
@@ -7475,7 +7588,7 @@ function GrimmorySync:performSync()
             cleanup_stats = cleanup_stats,
             local_count = #local_books,
             remote_count = catalog_stats and catalog_stats.entries_seen or #remote_books,
-            remote_epub_count = #remote_books,
+            remote_supported_count = #remote_books,
             api_error = api_error,
         }
     end)
@@ -7754,7 +7867,7 @@ function GrimmorySync:performMetadataRefreshForFile(file_path)
                 and (self.selected_feed_label ~= "" and self.selected_feed_label or self.selected_feed)
                 or _("All books")
             message = string.format(
-                _("No matching server book was found for this EPUB in the selected sync source.\n\nFile: %s\nSource: %s"),
+                _("No matching server book was found for this EPUB or CBZ file in the selected sync source.\n\nFile: %s\nSource: %s"),
                 stats.target_name or target_name,
                 sync_source
             )
@@ -7988,7 +8101,7 @@ function GrimmorySync:performMetadataRefresh()
         local confirm_dialog
         confirm_dialog = ConfirmBox:new{
             text = string.format(
-                _("Large metadata refresh detected\n\nLocal books: %d\nServer EPUBs: %d\nMetadata changes: %d\nOPDS timestamp changes: %d\nTotal to replace: %d\n\nNothing has been replaced yet. Continue only if you expect this many books to have changed."),
+                _("Large metadata refresh detected\n\nLocal books: %d\nServer EPUB/CBZ books: %d\nMetadata changes: %d\nOPDS timestamp changes: %d\nTotal to replace: %d\n\nNothing has been replaced yet. Continue only if you expect this many books to have changed."),
                 stats.local_count or 0,
                 stats.remote_count or 0,
                 queue_stats.metadata_changed or 0,
